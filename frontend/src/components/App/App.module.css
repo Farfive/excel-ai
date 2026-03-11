@@ -1,0 +1,185 @@
+/* ── Root layout ─────────────────────────────────────────────── */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+/* ── Top bar ─────────────────────────────────────────────────── */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 42px;
+  padding: 0 16px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.topbar__left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.topbar__logo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.topbar__logo-mark {
+  width: 20px;
+  height: 20px;
+  background: var(--accent);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.topbar__logo-text {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+.topbar__divider {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+}
+
+.topbar__filename {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar__right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.topbar__status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.topbar__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.topbar__dot--online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.topbar__dot--offline { background: var(--text-muted); }
+
+.topbar__model {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 7px;
+}
+
+.topbar__badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 7px;
+}
+
+.topbar__badge--warn {
+  color: var(--yellow);
+  background: var(--yellow-dim);
+  border-color: var(--yellow);
+}
+
+.topbar__upload-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.topbar__upload-btn:hover {
+  border-color: var(--border-hover);
+  color: var(--text-primary);
+}
+
+/* ── Main split ──────────────────────────────────────────────── */
+.workspace {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Resizer ─────────────────────────────────────────────────── */
+.resizer {
+  width: 4px;
+  background: var(--border);
+  cursor: col-resize;
+  flex-shrink: 0;
+  transition: background 0.15s;
+  position: relative;
+}
+
+.resizer:hover,
+.resizer--dragging {
+  background: var(--accent);
+}
+
+/* ── Left panel – Excel viewer ───────────────────────────────── */
+.leftPanel {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  min-width: 300px;
+  overflow: hidden;
+}
+
+/* ── Right panel – Chat ──────────────────────────────────────── */
+.rightPanel {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  min-width: 320px;
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}

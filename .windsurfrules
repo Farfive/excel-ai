@@ -1,0 +1,1 @@
+No external LLM API calls. No openai or anthropic packages. All AI runs via Ollama localhost:11434 and sentence-transformers locally. Python type hints required on all functions. React components require TypeScript interfaces. Never silent-catch errors — always log and return structured error. Use python-dotenv for all config.

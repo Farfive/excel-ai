@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+*.pyo
+.env
+tests/
+.git
+chroma_db/
+*.xlsx
+node_modules/
+dist/
