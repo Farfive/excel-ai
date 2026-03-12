@@ -86,6 +86,13 @@ async def upload_workbook(
 
         chroma.upsert_chunks(workbook_uuid, chunk_records)
 
+        # Build BM25 keyword index for hybrid search
+        try:
+            _retriever = RAGRetriever(embedder=embedder, store=chroma, ollama_client=None, graph=graph)
+            _retriever.build_bm25_index(workbook_uuid)
+        except Exception as e:
+            logger.warning(f"BM25 index build skipped: {e}")
+
         anomaly_count = sum(
             1 for n in graph.nodes() if graph.nodes[n].get("is_anomaly")
         )
@@ -143,6 +150,7 @@ async def ask(
 
     tools = ExcelTools(workbook_state=workbook_state, graph=graph, workbook_data=workbook_data)
     retriever = RAGRetriever(embedder=embedder, store=chroma, ollama_client=ollama_client, graph=graph)
+    retriever.build_bm25_index(uuid)
     agent = ExcelAgent(ollama=ollama_client, retriever=retriever, tools=tools, workbook_data=workbook_data)
 
     async def event_generator():

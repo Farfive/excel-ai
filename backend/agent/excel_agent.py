@@ -136,18 +136,19 @@ class ExcelAgent:
         self.scenario_manager = scenario_manager
 
     def build_cell_index(self, max_rows_per_sheet: int = 50) -> str:
-        """Build a highly compressed cell index optimized for small LLM token budgets.
+        """Build a SheetCompressor-style cell index with 3-layer context.
 
-        Structure per sheet:
-        - Headers (row 1)
-        - Row labels (col A) with value cell addresses (col B+)
-        - Formula patterns (compressed)
-        - Named ranges
+        Layer 1 — Local: cell labels + adjacent values per row
+        Layer 2 — Table: structural anchors (header rows, boundary rows like SUM/TOTAL)
+        Layer 3 — Document: cross-sheet formula refs, named ranges
+
         Fits ~3500 chars for typical financial models.
         """
         from openpyxl.utils import get_column_letter
         wb = self.workbook_data
         lines: List[str] = [f"CELL INDEX | Sheets: {', '.join(wb.sheets)}"]
+
+        cross_sheet_refs: List[str] = []
 
         for sheet_name in wb.sheets:
             sheet_cells = [
@@ -168,24 +169,39 @@ class ExcelAgent:
 
             lines.append(f"\n[{sheet_name}] {max_row}r x {max_col}c")
 
-            # --- Headers (row 1) compact ---
+            # --- Detect header row (first row with 2+ text values) ---
+            header_row = 1
+            for r in range(1, min(5, max_row + 1)):
+                text_count = sum(
+                    1 for c in range(1, max_col + 1)
+                    if cell_lookup.get((r, c)) and isinstance(cell_lookup[(r, c)].value, str)
+                )
+                if text_count >= 2:
+                    header_row = r
+                    break
+
+            # --- Structural anchors: header row ---
             hdrs = []
             for c in range(1, max_col + 1):
-                cd = cell_lookup.get((1, c))
+                cd = cell_lookup.get((header_row, c))
                 if cd and cd.value is not None:
                     hdrs.append(f"{get_column_letter(c)}={str(cd.value)[:15]}")
             if hdrs:
-                lines.append(f"H: {', '.join(hdrs)}")
+                lines.append(f"H(r{header_row}): {', '.join(hdrs)}")
 
-            # --- Row labels (col A) → value addresses ---
-            # Show label in A and the value/formula in B (most common layout)
+            # --- Layer 1: Row labels + values ---
             display_rows = min(max_row, max_rows_per_sheet)
             row_entries = []
-            for r in range(2, display_rows + 1):
+            boundary_rows = []
+            for r in range(header_row + 1, display_rows + 1):
                 label_cell = cell_lookup.get((r, 1))
                 if label_cell and label_cell.value is not None:
                     label = str(label_cell.value)[:18]
-                    # Find the primary value cell (first non-empty after A)
+
+                    # Detect boundary rows (Total, Subtotal, SUM)
+                    label_lower = label.lower()
+                    is_boundary = any(kw in label_lower for kw in ['total', 'subtotal', 'net ', 'gross '])
+
                     val_info = ""
                     for vc in range(2, min(max_col + 1, 4)):
                         vcd = cell_lookup.get((r, vc))
@@ -198,17 +214,34 @@ class ExcelAgent:
                                 vs = str(round(v, 4)) if isinstance(v, float) else str(v)[:12]
                                 val_info = f"{cl}{r}={vs}"
                             break
-                    row_entries.append(f"r{r}:A={label}" + (f",{val_info}" if val_info else ""))
+
+                    entry = f"r{r}:A={label}" + (f",{val_info}" if val_info else "")
+                    if is_boundary:
+                        entry = f"*{entry}"
+                        boundary_rows.append(r)
+                    row_entries.append(entry)
 
             if row_entries:
                 lines.append("DATA: " + " | ".join(row_entries))
 
-            # --- Formula patterns (only dominant patterns, very compact) ---
+            # --- Layer 2: Table boundaries ---
+            if boundary_rows:
+                lines.append(f"BOUNDS: rows {','.join(str(r) for r in boundary_rows[:6])}")
+
+            # --- Formula patterns (dominant per column) ---
             formula_cols: Dict[int, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
             for c in sheet_cells:
                 if c.formula and c.col <= max_col:
                     pattern = re.sub(r'\d+', 'N', c.formula)
                     formula_cols[c.col][pattern].append(c.row)
+
+                    # Layer 3: detect cross-sheet references
+                    if '!' in c.formula and len(cross_sheet_refs) < 8:
+                        ref_match = re.search(r"([A-Za-z ]+)!", c.formula)
+                        if ref_match:
+                            ref_sheet = ref_match.group(1).strip("'")
+                            cross_sheet_refs.append(f"{c.cell_address}→{ref_sheet}")
+
             fp_lines = []
             for col_idx in sorted(formula_cols.keys()):
                 cl = get_column_letter(col_idx)
@@ -223,6 +256,10 @@ class ExcelAgent:
             named = [(c.named_range, c.cell_address) for c in sheet_cells if c.named_range]
             if named:
                 lines.append(f"NR: {', '.join(f'{n}={a}' for n, a in named[:10])}")
+
+        # --- Layer 3: Cross-sheet formula references ---
+        if cross_sheet_refs:
+            lines.append(f"\nXREF: {' | '.join(cross_sheet_refs[:8])}")
 
         result = "\n".join(lines)
         max_chars = 4000
@@ -581,7 +618,7 @@ class ExcelAgent:
         yield {"event": "retrieving", "data": {"message": "Retrieving relevant context..."}}
 
         try:
-            chunks = await self.retriever.retrieve(query, workbook_uuid, k=5)
+            chunks = await self.retriever.retrieve(query, workbook_uuid, k=5, workbook_data=self.workbook_data)
             context = self.retriever.build_context(chunks, query)
         except Exception as e:
             logger.error(f"Retrieval failed: {e}")
@@ -623,18 +660,34 @@ class ExcelAgent:
 
             result = self.execute_step(step)
 
-            # --- Post-execution verify for write operations ---
+            # --- Post-execution verify + auto-retry for write operations ---
             if result.success and tool_name in ('write_range', 'write_formula'):
                 verify_sheet = args.get('sheet', '')
                 verify_addr = args.get('range') or args.get('cell', '')
                 if verify_sheet and verify_addr:
                     full_addr = f"{verify_sheet}!{verify_addr.upper()}"
-                    cell_data = self.tools.workbook_data.cells.get(full_addr)
                     state_data = self.tools.workbook_state.get(full_addr)
-                    if cell_data is None and state_data is None:
-                        logger.warning(f"Post-verify: cell {full_addr} not found after write")
+                    cell_data = self.tools.workbook_data.cells.get(full_addr)
+
+                    if state_data is None and cell_data is None:
+                        logger.warning(f"Post-verify FAIL: {full_addr} not found — retrying step")
+                        retry_result = self.execute_step(step)
+                        if retry_result.success:
+                            result = retry_result
+                            logger.info(f"Post-verify retry OK: {full_addr}")
+                        else:
+                            logger.error(f"Post-verify retry FAILED: {full_addr}: {retry_result.error}")
                     else:
-                        logger.info(f"Post-verify OK: {full_addr} = {state_data or (cell_data.value if cell_data else '?')}")
+                        actual = state_data if state_data is not None else (cell_data.value if cell_data else None)
+                        expected = args.get('values', [None])[0] if tool_name == 'write_range' else args.get('formula', '')
+                        if expected is not None and actual is not None:
+                            actual_str = str(actual.get('value', actual)) if isinstance(actual, dict) else str(actual)
+                            if str(expected) not in actual_str and actual_str not in str(expected):
+                                logger.warning(f"Post-verify MISMATCH: {full_addr} expected={expected} actual={actual_str}")
+                            else:
+                                logger.info(f"Post-verify OK: {full_addr} = {actual_str}")
+                        else:
+                            logger.info(f"Post-verify OK: {full_addr} = {actual}")
 
             execution_results.append({"step": step_num, "tool": tool_name, "success": result.success, "data": result.data, "error": result.error})
 
