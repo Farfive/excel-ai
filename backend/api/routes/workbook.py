@@ -396,6 +396,110 @@ async def download_workbook(
     )
 
 
+@router.post("/{uuid}/cell-edit")
+async def cell_edit(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+    states=Depends(get_workbook_states),
+    audit_trails=Depends(get_audit_trails),
+):
+    """Direct cell edit from the grid UI (user types a value or formula)."""
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    sheet = payload.get("sheet", "")
+    cell = payload.get("cell", "")  # e.g. "B4"
+    value = payload.get("value", "")
+
+    if not sheet or not cell:
+        raise HTTPException(status_code=400, detail="sheet and cell are required.")
+
+    from parser.xlsx_parser import CellData, _infer_data_type
+    from openpyxl.utils import column_index_from_string
+
+    full_addr = f"{sheet}!{cell}"
+    workbook_data = data_cache[uuid]
+    workbook_state = states.get(uuid, {})
+
+    # Capture old value
+    old_value = None
+    if full_addr in workbook_data.cells:
+        old_value = workbook_data.cells[full_addr].value
+
+    # Detect formula vs value
+    is_formula = isinstance(value, str) and value.startswith("=")
+    formula_str = value[1:] if is_formula else None
+
+    # Parse numeric
+    parsed_value = value
+    if not is_formula and isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            parsed_value = None
+        else:
+            try:
+                parsed_value = int(stripped)
+            except ValueError:
+                try:
+                    parsed_value = float(stripped)
+                except ValueError:
+                    parsed_value = stripped
+
+    # Write to workbook_data
+    if full_addr in workbook_data.cells:
+        workbook_data.cells[full_addr].value = parsed_value
+        workbook_data.cells[full_addr].formula = formula_str
+        workbook_data.cells[full_addr].data_type = _infer_data_type(parsed_value, formula_str)
+        workbook_data.cells[full_addr].is_hardcoded = not is_formula and isinstance(parsed_value, (int, float))
+    else:
+        col_part = "".join(c for c in cell if c.isalpha())
+        row_part = "".join(c for c in cell if c.isdigit())
+        if col_part and row_part:
+            workbook_data.cells[full_addr] = CellData(
+                cell_address=full_addr,
+                sheet_name=sheet,
+                value=parsed_value,
+                formula=formula_str,
+                data_type=_infer_data_type(parsed_value, formula_str),
+                named_range=None,
+                row=int(row_part),
+                col=column_index_from_string(col_part),
+                is_hardcoded=not is_formula and isinstance(parsed_value, (int, float)),
+                is_merged=False,
+                merge_master=None,
+            )
+
+    # Update state
+    workbook_state[full_addr] = {
+        "value": parsed_value,
+        "formula": formula_str,
+        "data_type": _infer_data_type(parsed_value, formula_str),
+    }
+
+    # Log to audit trail
+    from analysis.audit_trail import AuditTrail
+    if uuid not in audit_trails:
+        audit_trails[uuid] = AuditTrail()
+    audit_trails[uuid].record_change(
+        cell=full_addr,
+        sheet=sheet,
+        old_value=old_value,
+        new_value=parsed_value,
+        old_formula=None,
+        new_formula=formula_str,
+        reason="Manual cell edit",
+        approved_by="user",
+    )
+
+    return {
+        "cell": full_addr,
+        "old_value": old_value,
+        "new_value": parsed_value,
+        "formula": formula_str,
+    }
+
+
 @router.post("/{uuid}/revert")
 async def revert_changes(
     uuid: str,

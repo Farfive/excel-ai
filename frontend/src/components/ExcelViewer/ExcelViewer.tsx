@@ -1,6 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { WorkbookInfo } from '../../types';
-import { getAnomalies, getWorkbookGrid, revertChanges, downloadWorkbook, getAuditTrail, AuditChange, diffWorkbooks } from '../../services/api';
+import { getAnomalies, getWorkbookGrid, revertChanges, downloadWorkbook, getAuditTrail, AuditChange, diffWorkbooks, editCell } from '../../services/api';
 import { onGridRefresh, onGridDiff, CellChange } from '../../services/gridBus';
 import { AnalysisPanel } from '../Analysis/AnalysisPanel';
 import { WorkbookSummary } from '../WorkbookSummary/WorkbookSummary';
@@ -59,6 +59,17 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
   const diffInputRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const prevUuid = useRef<string | null>(null);
+  const gridWrapRef = useRef<HTMLDivElement>(null);
+  const cellEditRef = useRef<HTMLInputElement>(null);
+  const formulaInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Cell selection & editing state ──
+  const [selectedCell, setSelectedCell] = useState<{row: number; col: number} | null>(null);
+  const [editingCell, setEditingCell] = useState<{row: number; col: number} | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const currentSheet = sheets[activeSheet] || null;
 
   const pendingMap = useRef<Map<string, CellChange>>(new Map());
   useEffect(() => {
@@ -130,6 +141,106 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
     setPendingChanges([]);
   };
 
+  // ── Cell editing helpers ──
+  const getCellAddr = useCallback((row: number, col: number): string => {
+    if (!currentSheet) return '';
+    return `${currentSheet.colHeaders[col] || ''}${row + 1}`;
+  }, [sheets, activeSheet]);
+
+  const getRawCell = useCallback((row: number, col: number): RawCell | null => {
+    const s = sheets[activeSheet];
+    if (!s || !s.rows[row]) return null;
+    return s.rows[row][col] || null;
+  }, [sheets, activeSheet]);
+
+  const startEditing = useCallback((row: number, col: number, initialValue?: string) => {
+    const cell = getRawCell(row, col);
+    const val = initialValue !== undefined ? initialValue : (cell?.f ? `=${cell.v}` : (cell?.v ?? ''));
+    setEditingCell({ row, col });
+    setEditValue(val);
+    setTimeout(() => cellEditRef.current?.focus(), 0);
+  }, [getRawCell]);
+
+  const cancelEditing = useCallback(() => {
+    setEditingCell(null);
+    setEditValue('');
+    setTimeout(() => gridWrapRef.current?.focus(), 0);
+  }, []);
+
+  const commitEdit = useCallback(async (moveRow = 0, moveCol = 0) => {
+    if (!editingCell || !workbookInfo || !currentSheet || saving) return;
+    const addr = getCellAddr(editingCell.row, editingCell.col);
+    const oldCell = getRawCell(editingCell.row, editingCell.col);
+    const oldVal = oldCell?.v ?? '';
+
+    // If value unchanged, just cancel
+    const newVal = editValue;
+    if (newVal === oldVal || (newVal === `=${oldVal}` && oldCell?.f)) {
+      setEditingCell(null);
+      setEditValue('');
+    } else {
+      setSaving(true);
+      try {
+        await editCell(workbookInfo.workbook_uuid, currentSheet.name, addr, newVal);
+        fetchGrid(workbookInfo.workbook_uuid);
+      } catch (e) {
+        console.error('Cell edit failed:', e);
+      } finally {
+        setSaving(false);
+      }
+      setEditingCell(null);
+      setEditValue('');
+    }
+
+    // Move selection
+    if (moveRow !== 0 || moveCol !== 0) {
+      setSelectedCell(prev => {
+        if (!prev) return prev;
+        const maxRow = currentSheet.rows.length - 1;
+        const maxCol = currentSheet.colHeaders.length - 1;
+        const nr = Math.max(0, Math.min(maxRow, prev.row + moveRow));
+        const nc = Math.max(0, Math.min(maxCol, prev.col + moveCol));
+        return { row: nr, col: nc };
+      });
+    }
+    setTimeout(() => gridWrapRef.current?.focus(), 0);
+  }, [editingCell, editValue, workbookInfo, sheets, activeSheet, saving, getCellAddr, getRawCell]);
+
+  // ── Keyboard handler for grid ──
+  const handleGridKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (!currentSheet) return;
+    const maxRow = currentSheet.rows.length - 1;
+    const maxCol = currentSheet.colHeaders.length - 1;
+
+    // If editing a cell
+    if (editingCell) {
+      if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); return; }
+      if (e.key === 'Enter') { e.preventDefault(); commitEdit(1, 0); return; }
+      if (e.key === 'Tab') { e.preventDefault(); commitEdit(0, e.shiftKey ? -1 : 1); return; }
+      return; // let other keys go to input
+    }
+
+    // If a cell is selected but not editing
+    if (selectedCell) {
+      const { row, col } = selectedCell;
+      if (e.key === 'ArrowDown')  { e.preventDefault(); setSelectedCell({ row: Math.min(maxRow, row + 1), col }); return; }
+      if (e.key === 'ArrowUp')    { e.preventDefault(); setSelectedCell({ row: Math.max(0, row - 1), col }); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); setSelectedCell({ row, col: Math.min(maxCol, col + 1) }); return; }
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); setSelectedCell({ row, col: Math.max(0, col - 1) }); return; }
+      if (e.key === 'Tab')        { e.preventDefault(); setSelectedCell({ row, col: Math.min(maxCol, col + (e.shiftKey ? -1 : 1)) }); return; }
+      if (e.key === 'Enter')      { e.preventDefault(); startEditing(row, col); return; }
+      if (e.key === 'F2')         { e.preventDefault(); startEditing(row, col); return; }
+      if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); startEditing(row, col, ''); return; }
+      if (e.key === 'Escape')     { e.preventDefault(); setSelectedCell(null); return; }
+      // Printable character → start editing with that char
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        startEditing(row, col, e.key);
+        return;
+      }
+    }
+  }, [selectedCell, editingCell, editValue, currentSheet, startEditing, cancelEditing, commitEdit]);
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
@@ -179,8 +290,6 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
       </div>
     );
   }
-
-  const currentSheet = sheets[activeSheet];
 
   return (
     <div className={styles.viewer}>
@@ -415,15 +524,58 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                 <button
                   key={s.name}
                   className={`${styles.sheetTab} ${i === activeSheet ? styles['sheetTab--active'] : ''}`}
-                  onClick={() => setActiveSheet(i)}
+                  onClick={() => { setActiveSheet(i); setSelectedCell(null); setEditingCell(null); }}
                   type="button"
                 >{s.name}</button>
               ))}
             </div>
           )}
 
+          {/* Formula bar */}
+          {currentSheet && (
+            <div className={styles.formulaBar}>
+              <span className={styles.formulaBar__addr}>
+                {selectedCell ? getCellAddr(selectedCell.row, selectedCell.col) : ''}
+              </span>
+              <span className={styles.formulaBar__fx}>fx</span>
+              <input
+                ref={formulaInputRef}
+                className={styles.formulaBar__input}
+                value={editingCell ? editValue : (
+                  selectedCell ? (() => {
+                    const rc = getRawCell(selectedCell.row, selectedCell.col);
+                    return rc ? (rc.f ? `=${rc.v}` : rc.v) : '';
+                  })() : ''
+                )}
+                onChange={e => {
+                  if (editingCell) {
+                    setEditValue(e.target.value);
+                  } else if (selectedCell) {
+                    startEditing(selectedCell.row, selectedCell.col, e.target.value);
+                  }
+                }}
+                onFocus={() => {
+                  if (selectedCell && !editingCell) {
+                    startEditing(selectedCell.row, selectedCell.col);
+                  }
+                }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') { e.preventDefault(); commitEdit(1, 0); }
+                  if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); }
+                  if (e.key === 'Tab') { e.preventDefault(); commitEdit(0, e.shiftKey ? -1 : 1); }
+                }}
+                readOnly={!editingCell && !selectedCell}
+              />
+            </div>
+          )}
+
           {/* Grid */}
-          <div className={styles.gridWrap}>
+          <div
+            className={styles.gridWrap}
+            ref={gridWrapRef}
+            tabIndex={0}
+            onKeyDown={handleGridKeyDown}
+          >
             {loadingGrid ? (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 10, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
                 <div className={styles.dropzone__spinner} style={{ width: 16, height: 16 }} />
@@ -434,15 +586,18 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                 <thead>
                   <tr>
                     <th className={styles.grid__rowNum}>#</th>
-                    {currentSheet.colHeaders.map(h => (
-                      <th key={h}>{h}</th>
+                    {currentSheet.colHeaders.map((h, ci) => (
+                      <th
+                        key={h}
+                        className={selectedCell?.col === ci ? styles['grid__colHeader--selected'] : ''}
+                      >{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {currentSheet.rows.map((row, r) => (
                     <tr key={r}>
-                      <td className={styles.grid__rowNum}>{r + 1}</td>
+                      <td className={`${styles.grid__rowNum} ${selectedCell?.row === r ? styles['grid__rowNum--selected'] : ''}`}>{r + 1}</td>
                       {row.map((cell, c) => {
                         const colLtr = currentSheet.colHeaders[c] || '';
                         const addr = `${currentSheet.name}!${colLtr}${r + 1}`;
@@ -453,6 +608,8 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                         const isFormula = cell.f;
                         const isNum = isNumeric(cell.v);
                         const isHeader = r === 0 && !isFormula && !isEmpty;
+                        const isSel = selectedCell?.row === r && selectedCell?.col === c;
+                        const isEditing = editingCell?.row === r && editingCell?.col === c;
                         const cls = [
                           styles.grid__cell,
                           isFormula ? styles['grid__cell--formula'] : styles['grid__cell--hardcoded'],
@@ -461,10 +618,42 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                           isEmpty ? styles['grid__cell--empty'] : '',
                           isAnomaly ? styles['grid__cell--anomaly'] : '',
                           isPending ? styles['grid__cell--pending'] : '',
+                          isSel && !isEditing ? styles['grid__cell--selected'] : '',
+                          isEditing ? styles['grid__cell--editing'] : '',
+                          selectedCell && !isSel && selectedCell.col === c ? styles.grid__colHighlight : '',
+                          selectedCell && !isSel && selectedCell.row === r ? styles.grid__rowHighlight : '',
                         ].filter(Boolean).join(' ');
                         return (
-                          <td key={c} className={cls} title={isPending ? `${formatDiffVal(pending.before)} → ${formatDiffVal(pending.after)}` : (cell.nr ? `Named: ${cell.nr}` : cell.v)}>
-                            {isPending ? (
+                          <td
+                            key={c}
+                            className={cls}
+                            title={isPending ? `${formatDiffVal(pending.before)} → ${formatDiffVal(pending.after)}` : (cell.nr ? `Named: ${cell.nr}` : cell.v)}
+                            onClick={() => {
+                              if (isEditing) return;
+                              setSelectedCell({ row: r, col: c });
+                              if (editingCell) commitEdit();
+                            }}
+                            onDoubleClick={() => startEditing(r, c)}
+                          >
+                            {isEditing ? (
+                              <input
+                                ref={cellEditRef}
+                                value={editValue}
+                                onChange={e => setEditValue(e.target.value)}
+                                onKeyDown={e => {
+                                  if (e.key === 'Enter') { e.preventDefault(); commitEdit(1, 0); }
+                                  if (e.key === 'Tab') { e.preventDefault(); commitEdit(0, e.shiftKey ? -1 : 1); }
+                                  if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); }
+                                }}
+                                onBlur={() => {
+                                  // Delay to allow click events to fire first
+                                  setTimeout(() => {
+                                    if (editingCell?.row === r && editingCell?.col === c) commitEdit();
+                                  }, 100);
+                                }}
+                                autoFocus
+                              />
+                            ) : isPending ? (
                               <>
                                 <span className={styles['cellOld']}>{formatDiffVal(pending.before)}</span>
                                 <span className={styles['cellNew']}>{formatDiffVal(pending.after)}</span>

@@ -281,6 +281,21 @@ export async function getSummary(uuid: string): Promise<WorkbookSummaryData> {
   return res.json();
 }
 
+export async function editCell(
+  uuid: string,
+  sheet: string,
+  cell: string,
+  value: string,
+): Promise<{ cell: string; old_value: unknown; new_value: unknown; formula: string | null }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/cell-edit`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sheet, cell, value }),
+  });
+  if (!res.ok) throw new Error(`Cell edit failed: HTTP ${res.status}`);
+  return res.json();
+}
+
 export async function getWorkbookGrid(uuid: string): Promise<{
   sheets: Array<{
     name: string;
