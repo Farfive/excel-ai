@@ -31,6 +31,19 @@ export interface PlanStep {
   reason: string;
 }
 
+export interface ImpactKPI {
+  label: string;
+  cell: string;
+  current_value: string;
+  sheet: string;
+}
+
+export interface ImpactPreview {
+  cells_affected: number;
+  kpis: ImpactKPI[];
+  written: Array<{ cell: string; new_value: string }>;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -71,6 +84,7 @@ export interface SSEEvent {
     message?: string;
     plan?: PlanStep[];
     requiresApproval?: boolean;
+    impact_preview?: ImpactPreview;
     step?: number;
     tool?: string;
     args?: Record<string, unknown>;

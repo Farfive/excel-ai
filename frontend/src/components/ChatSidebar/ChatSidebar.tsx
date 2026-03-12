@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { useSSE, AgentMode } from '../../hooks/useSSE';
-import { ChatMessage, ToolStep, PlanStep, CellDiff } from '../../types';
+import { ChatMessage, ToolStep, PlanStep, CellDiff, ImpactPreview, ImpactKPI } from '../../types';
 import { confirmDelete } from '../../services/api';
 import { emitGridRefresh, emitGridDiff } from '../../services/gridBus';
 import styles from './ChatSidebar.module.css';
@@ -9,12 +9,82 @@ interface Props {
   workbookUuid: string | null;
 }
 
-const HINTS = [
-  'Explain the revenue assumptions on Sheet "Assumptions"',
-  'What are the top 3 anomalies in this model?',
-  'Run an integrity check on the workbook',
-  'What is the DCF implied share price?',
-];
+const MODE_CONFIG = {
+  agent: {
+    icon: (
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+      </svg>
+    ),
+    title: 'Agent Mode',
+    sub: <>AI automatically plans and executes actions.<br />Just describe what you want done.</>,
+    hints: [
+      'Change WACC to 9% and update all downstream cells',
+      'Add a new "Scenarios" sheet with Base / Bull / Bear cases',
+      'Fix all hardcoded values in the Assumptions sheet',
+      'Recalculate Revenue Growth Rate for 2026 to 15%',
+    ],
+  },
+  plan: {
+    icon: (
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+    ),
+    title: 'Plan Mode',
+    sub: <>AI shows execution plan + impact analysis<br />before making any changes. You approve first.</>,
+    hints: [
+      'Update Revenue Growth Rate to 20% — show impact',
+      'Increase EBITDA margin assumptions by 2pp',
+      'Change Discount Rate and show effect on Enterprise Value',
+      'Adjust CapEx % of Revenue across all years',
+    ],
+  },
+  ask: {
+    icon: (
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+    ),
+    title: 'Ask Mode',
+    sub: <>Read-only Q&amp;A — AI answers questions<br />and never modifies your data.</>,
+    hints: [
+      'What is the DCF implied share price?',
+      'Explain the revenue assumptions on the Assumptions sheet',
+      'What are the top 3 anomalies in this model?',
+      'What drives the biggest change in Enterprise Value?',
+    ],
+  },
+};
+
+function EmptyState({ mode, workbookUuid, onHintClick }: { mode: AgentMode; workbookUuid: string | null; onHintClick: (h: string) => void }) {
+  if (!workbookUuid) {
+    return (
+      <div className={styles.empty}>
+        <svg className={styles.empty__icon} width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <div className={styles.empty__title}>Upload a workbook to start</div>
+        <div className={styles.empty__sub}>Upload an .xlsx file to analyse,<br />modify or ask questions about it.</div>
+      </div>
+    );
+  }
+  const cfg = MODE_CONFIG[mode];
+  return (
+    <div className={styles.empty}>
+      <div className={styles.empty__icon}>{cfg.icon}</div>
+      <div className={styles.empty__title}>{cfg.title}</div>
+      <div className={styles.empty__sub}>{cfg.sub}</div>
+      <div className={styles.empty__hints}>
+        {cfg.hints.map(h => (
+          <button key={h} className={styles.empty__hint} onClick={() => onHintClick(h)} type="button">
+            {h}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function formatTime(d: Date): string {
   return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
@@ -119,14 +189,58 @@ function ToolStepRow({ step, workbookUuid, onDeleteConfirmed }: { step: ToolStep
   );
 }
 
-function PlanView({ plan, onApprove, onReject }: { plan: PlanStep[]; onApprove: () => void; onReject: () => void }) {
+function PlanView({ plan, impact, onApprove, onReject }: { plan: PlanStep[]; impact: ImpactPreview | null; onApprove: () => void; onReject: () => void }) {
   const [expandedStep, setExpandedStep] = useState<number | null>(null);
+  const writeSteps = plan.filter(s => ['write_range', 'write_formula', 'add_column', 'add_row', 'delete_range'].includes(s.tool));
+  const isReadOnly = writeSteps.length === 0;
   return (
     <div className={styles.plan}>
       <div className={styles.plan__header}>
         <span className={styles.plan__title}>Execution Plan</span>
         <span className={styles.plan__subtitle}>{plan.length} step{plan.length !== 1 ? 's' : ''} · requires approval</span>
       </div>
+
+      {/* Impact Preview */}
+      {impact && !isReadOnly && (
+        <div className={styles.impact}>
+          <div className={styles.impact__header}>
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a.5.5 0 0 1 .5.5v6h6a.5.5 0 0 1 0 1h-6v6a.5.5 0 0 1-1 0v-6h-6a.5.5 0 0 1 0-1h6v-6A.5.5 0 0 1 8 1z"/></svg>
+            Impact Analysis
+            <span className={styles.impact__badge}>{impact.cells_affected} cells affected</span>
+          </div>
+          {impact.written.length > 0 && (
+            <div className={styles.impact__writes}>
+              {impact.written.map(w => (
+                <div key={w.cell} className={styles.impact__write}>
+                  <span className={styles.impact__writeCell}>{w.cell.split('!')[1] ?? w.cell}</span>
+                  <span className={styles.impact__writeArrow}>→</span>
+                  <span className={styles.impact__writeVal}>{w.new_value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {impact.kpis.length > 0 && (
+            <>
+              <div className={styles.impact__kpiTitle}>Affected KPIs (current values)</div>
+              <div className={styles.impact__kpis}>
+                {impact.kpis.map((kpi: ImpactKPI) => (
+                  <div key={kpi.cell} className={styles.impact__kpi}>
+                    <div className={styles.impact__kpiLabel}>{kpi.label}</div>
+                    <div className={styles.impact__kpiValue}>{kpi.current_value}</div>
+                    <div className={styles.impact__kpiSheet}>{kpi.sheet}</div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {impact.kpis.length === 0 && impact.cells_affected > 0 && (
+            <div className={styles.impact__noKpi}>
+              {impact.cells_affected} formula cells will recalculate
+            </div>
+          )}
+        </div>
+      )}
+
       <div className={styles.plan__steps}>
         {plan.map(step => {
           const hasArgs = step.args && Object.keys(step.args).length > 0;
@@ -196,7 +310,7 @@ function MessageRow({ message, workbookUuid }: { message: ChatMessage; workbookU
 }
 
 export function ChatSidebar({ workbookUuid }: Props): React.ReactElement {
-  const { messages, isStreaming, pendingPlan, mode, setMode, sendMessage, approvePlan, rejectPlan } = useSSE(workbookUuid);
+  const { messages, isStreaming, pendingPlan, impactPreview, mode, setMode, sendMessage, approvePlan, rejectPlan } = useSSE(workbookUuid);
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -251,6 +365,14 @@ export function ChatSidebar({ workbookUuid }: Props): React.ReactElement {
           >
             📋 Plan
           </button>
+          <button
+            className={`${styles.modeToggle__btn} ${mode === 'ask' ? styles['modeToggle__btn--active'] : ''}`}
+            onClick={() => setMode('ask')}
+            type="button"
+            title="Ask mode: read-only Q&A, AI never modifies data"
+          >
+            💬 Ask
+          </button>
         </div>
         {messages.length > 0 && (
           <button className={styles.header__clear} onClick={handleClear} type="button">Clear</button>
@@ -260,28 +382,12 @@ export function ChatSidebar({ workbookUuid }: Props): React.ReactElement {
       {/* Messages */}
       <div className={styles.messages}>
         {messages.length === 0 ? (
-          <div className={styles.empty}>
-            <svg className={styles.empty__icon} width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-            </svg>
-            <div className={styles.empty__title}>
-              {workbookUuid ? 'Ask about your workbook' : 'Upload a workbook to start'}
-            </div>
-            {workbookUuid && (
-              <>
-                <div className={styles.empty__sub}>
-                  Ask questions, request modifications,<br />run analysis or explore the model.
-                </div>
-                <div className={styles.empty__hints}>
-                  {HINTS.map(h => (
-                    <button key={h} className={styles.empty__hint} onClick={() => { setInput(h); textareaRef.current?.focus(); }} type="button">
-                      {h}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
+          <EmptyState
+            key={mode}
+            mode={mode}
+            workbookUuid={workbookUuid}
+            onHintClick={(h) => { setInput(h); textareaRef.current?.focus(); }}
+          />
         ) : (
           messages.map(m => <MessageRow key={m.id} message={m} workbookUuid={workbookUuid} />)
         )}
@@ -299,7 +405,7 @@ export function ChatSidebar({ workbookUuid }: Props): React.ReactElement {
 
       {/* Plan approval */}
       {pendingPlan && (
-        <PlanView plan={pendingPlan} onApprove={approvePlan} onReject={rejectPlan} />
+        <PlanView plan={pendingPlan} impact={impactPreview} onApprove={approvePlan} onReject={rejectPlan} />
       )}
 
       {/* Input */}
@@ -311,7 +417,7 @@ export function ChatSidebar({ workbookUuid }: Props): React.ReactElement {
             value={input}
             onChange={handleChange}
             onKeyDown={handleKey}
-            placeholder={workbookUuid ? 'Ask anything about the workbook…' : 'Upload a workbook first'}
+            placeholder={!workbookUuid ? 'Upload a workbook first' : mode === 'ask' ? 'Ask a question (read-only, no changes)…' : 'Ask anything about the workbook…'}
             disabled={!workbookUuid || isStreaming}
             rows={1}
           />

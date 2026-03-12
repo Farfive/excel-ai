@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import { ChatMessage, ToolStep, PlanStep, SSEEvent } from '../types';
+import { ChatMessage, ToolStep, PlanStep, SSEEvent, ImpactPreview } from '../types';
 import { askQuestion } from '../services/api';
 import { emitGridRefresh, emitGridDiff, CellChange } from '../services/gridBus';
 
@@ -8,12 +8,13 @@ function nextId(): string {
   return `msg_${++msgIdCounter}_${Date.now()}`;
 }
 
-export type AgentMode = 'agent' | 'plan';
+export type AgentMode = 'agent' | 'plan' | 'ask';
 
 interface UseSSEReturn {
   messages: ChatMessage[];
   isStreaming: boolean;
   pendingPlan: PlanStep[] | null;
+  impactPreview: ImpactPreview | null;
   mode: AgentMode;
   setMode: (m: AgentMode) => void;
   sendMessage: (question: string, approvedPlan?: PlanStep[]) => Promise<void>;
@@ -25,6 +26,7 @@ export function useSSE(workbookUuid: string | null): UseSSEReturn {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [pendingPlan, setPendingPlan] = useState<PlanStep[] | null>(null);
+  const [impactPreview, setImpactPreview] = useState<ImpactPreview | null>(null);
   const [mode, setMode] = useState<AgentMode>('agent');
   const pendingQuestionRef = useRef<string>('');
   const modeRef = useRef<AgentMode>(mode);
@@ -99,6 +101,7 @@ export function useSSE(workbookUuid: string | null): UseSSEReturn {
 
     if (type === 'plan_ready' && data.requiresApproval && data.plan) {
       setPendingPlan(data.plan);
+      setImpactPreview(data.impact_preview ?? null);
       setIsStreaming(false);
       setMessages(prev =>
         prev.map(m =>
@@ -203,11 +206,13 @@ export function useSSE(workbookUuid: string | null): UseSSEReturn {
     const plan = pendingPlan;
     const question = pendingQuestionRef.current;
     setPendingPlan(null);
+    setImpactPreview(null);
     await sendMessage(question, plan);
   }, [pendingPlan, sendMessage]);
 
   const rejectPlan = useCallback(() => {
     setPendingPlan(null);
+    setImpactPreview(null);
     setMessages(prev => {
       const last = prev[prev.length - 1];
       if (last && last.role === 'assistant' && last.isStreaming) {
@@ -219,5 +224,5 @@ export function useSSE(workbookUuid: string | null): UseSSEReturn {
     });
   }, []);
 
-  return { messages, isStreaming, pendingPlan, mode, setMode, sendMessage, approvePlan, rejectPlan };
+  return { messages, isStreaming, pendingPlan, impactPreview, mode, setMode, sendMessage, approvePlan, rejectPlan };
 }

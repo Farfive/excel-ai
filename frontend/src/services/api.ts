@@ -23,7 +23,7 @@ export async function* askQuestion(
   uuid: string,
   question: string,
   approvedPlan?: PlanStep[],
-  mode: 'agent' | 'plan' = 'agent',
+  mode: 'agent' | 'plan' | 'ask' = 'agent',
 ): AsyncGenerator<SSEEvent> {
   const res = await fetch(`${BASE_URL}/workbook/${uuid}/ask`, {
     method: 'POST',
@@ -296,14 +296,182 @@ export async function editCell(
   return res.json();
 }
 
+export interface CellStyleData {
+  b?: boolean; i?: boolean; u?: boolean;
+  fs?: number; fn?: string; fc?: string; bg?: string;
+  ha?: string; va?: string; wt?: boolean; ind?: number;
+  nf?: string;
+  bt?: string; bb?: string; bl?: string; br?: string; bc?: string;
+}
+
+export interface GridCell {
+  v: string; f: boolean; t: string; nr?: string;
+  s?: CellStyleData; mg?: boolean; mm?: string;
+}
+
 export async function getWorkbookGrid(uuid: string): Promise<{
   sheets: Array<{
     name: string;
     colHeaders: string[];
-    rows: Array<Array<{ v: string; f: boolean; t: string; nr?: string }>>;
+    rows: Array<Array<GridCell>>;
   }>;
 }> {
   const res = await fetch(`${BASE_URL}/workbook/${uuid}/grid`);
   if (!res.ok) throw new Error(`Grid fetch failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function formatCells(
+  uuid: string, cells: string[], style: Partial<CellStyleData>,
+): Promise<{ updated: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/format-cells`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cells, style }),
+  });
+  if (!res.ok) throw new Error(`Format failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function insertRow(
+  uuid: string, sheet: string, row: number, count = 1,
+): Promise<{ inserted: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/insert-row`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sheet, row, count }),
+  });
+  if (!res.ok) throw new Error(`Insert row failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function insertCol(
+  uuid: string, sheet: string, col: number, count = 1,
+): Promise<{ inserted: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/insert-col`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sheet, col, count }),
+  });
+  if (!res.ok) throw new Error(`Insert col failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function deleteRow(
+  uuid: string, sheet: string, row: number, count = 1,
+): Promise<{ deleted: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/delete-row`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sheet, row, count }),
+  });
+  if (!res.ok) throw new Error(`Delete row failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function deleteCol(
+  uuid: string, sheet: string, col: number, count = 1,
+): Promise<{ deleted: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/delete-col`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sheet, col, count }),
+  });
+  if (!res.ok) throw new Error(`Delete col failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export interface DataValidationRule {
+  type: 'list' | 'number' | 'text_length';
+  values?: string[];
+  min?: number;
+  max?: number;
+  message?: string;
+  error_message?: string;
+}
+
+export async function setDataValidation(
+  uuid: string, cells: string[], rule: DataValidationRule,
+): Promise<{ updated: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/data-validation`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cells, ...rule }),
+  });
+  if (!res.ok) throw new Error(`Data validation failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function getDataValidation(
+  uuid: string,
+): Promise<{ validations: Record<string, DataValidationRule> }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/data-validation`);
+  if (!res.ok) throw new Error(`Get validation failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function setNamedRange(
+  uuid: string, name: string, range: string,
+): Promise<{ name: string; range: string; total: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/named-ranges`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, range }),
+  });
+  if (!res.ok) throw new Error(`Named range failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function deleteNamedRange(
+  uuid: string, name: string,
+): Promise<{ deleted: string }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/named-ranges/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Delete named range failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function getNamedRanges(
+  uuid: string,
+): Promise<{ named_ranges: Record<string, string> }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/named-ranges`);
+  if (!res.ok) throw new Error(`Get named ranges failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function goalSeek(
+  uuid: string, targetCell: string, goal: number, changingCell: string,
+): Promise<{ changing_cell: string; result_value: number; achieved_value: number; goal: number; difference: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/goal-seek`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_cell: targetCell, goal, changing_cell: changingCell }),
+  });
+  if (!res.ok) throw new Error(`Goal seek failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function textToColumns(
+  uuid: string, sheet: string, col: number, delimiter: string,
+): Promise<{ split_into_columns: number; cells_written: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/text-to-columns`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sheet, col, delimiter }),
+  });
+  if (!res.ok) throw new Error(`Text to columns failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function removeDuplicates(
+  uuid: string, sheet: string, columns: number[] = [],
+): Promise<{ removed: number; remaining_rows: number }> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/remove-duplicates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sheet, columns, keep_first: true }),
+  });
+  if (!res.ok) throw new Error(`Remove duplicates failed: HTTP ${res.status}`);
   return res.json();
 }

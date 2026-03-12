@@ -470,6 +470,142 @@
   color: var(--text-primary);
 }
 
+/* ── Impact Preview ──────────────────────────────────────────── */
+.impact {
+  margin: 0 14px 8px;
+  background: #fff8f0;
+  border: 1px solid #fed7aa;
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.impact__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  background: #fff1e6;
+  border-bottom: 1px solid #fed7aa;
+  font-size: 11px;
+  font-weight: 600;
+  color: #c2410c;
+  font-family: var(--font-mono);
+}
+
+.impact__badge {
+  margin-left: auto;
+  background: #c2410c;
+  color: #fff;
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.impact__writes {
+  padding: 7px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-bottom: 1px solid #fed7aa;
+}
+
+.impact__write {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.impact__writeCell {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  background: #fff;
+  border: 1px solid #fed7aa;
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: #9a3412;
+}
+
+.impact__writeArrow {
+  color: #c2410c;
+  font-size: 10px;
+}
+
+.impact__writeVal {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: #065f46;
+  background: #d1fae5;
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+.impact__kpiTitle {
+  padding: 6px 12px 3px;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.impact__kpis {
+  padding: 0 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.impact__kpis::-webkit-scrollbar { width: 3px; }
+.impact__kpis::-webkit-scrollbar-thumb { background: #fed7aa; border-radius: 2px; }
+
+.impact__kpi {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  background: #fff;
+  border: 1px solid #fde8d0;
+  border-radius: 4px;
+}
+
+.impact__kpiLabel {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-primary);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.impact__kpiValue {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: #1d4ed8;
+}
+
+.impact__kpiSheet {
+  font-size: 9px;
+  color: var(--text-muted);
+  background: var(--bg-hover);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.impact__noKpi {
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
 /* ── Input area ──────────────────────────────────────────────── */
 .inputArea {
   flex-shrink: 0;

@@ -1,23 +1,82 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { WorkbookInfo } from '../../types';
-import { getAnomalies, getWorkbookGrid, revertChanges, downloadWorkbook, getAuditTrail, AuditChange, diffWorkbooks, editCell } from '../../services/api';
+import {
+  getAnomalies, getWorkbookGrid, revertChanges, downloadWorkbook,
+  getAuditTrail, AuditChange, diffWorkbooks, editCell,
+  formatCells, insertRow, insertCol, deleteRow, deleteCol,
+  GridCell, CellStyleData,
+  setDataValidation, getDataValidation, DataValidationRule,
+  setNamedRange, deleteNamedRange, getNamedRanges,
+  goalSeek, textToColumns, removeDuplicates,
+} from '../../services/api';
 import { onGridRefresh, onGridDiff, CellChange } from '../../services/gridBus';
 import { AnalysisPanel } from '../Analysis/AnalysisPanel';
 import { WorkbookSummary } from '../WorkbookSummary/WorkbookSummary';
+import { FormatToolbar } from '../FormatToolbar/FormatToolbar';
+import { ChartPanel } from '../ChartPanel/ChartPanel';
 import styles from './ExcelViewer.module.css';
 
-interface RawCell {
-  v: string;
-  f: boolean;
-  t: string;
-  nr?: string;
-}
+type RawCell = GridCell;
 
 interface SheetData {
   name: string;
   rows: RawCell[][];
   colHeaders: string[];
 }
+
+interface CellPos { row: number; col: number; }
+
+interface SelectionRange {
+  start: CellPos;
+  end: CellPos;
+}
+
+function normalizeRange(r: SelectionRange): { r1: number; c1: number; r2: number; c2: number } {
+  return {
+    r1: Math.min(r.start.row, r.end.row),
+    c1: Math.min(r.start.col, r.end.col),
+    r2: Math.max(r.start.row, r.end.row),
+    c2: Math.max(r.start.col, r.end.col),
+  };
+}
+
+function isCellInSelection(row: number, col: number, sel: SelectionRange | null): boolean {
+  if (!sel) return false;
+  const { r1, c1, r2, c2 } = normalizeRange(sel);
+  return row >= r1 && row <= r2 && col >= c1 && col <= c2;
+}
+
+function cellStyleToCSS(s?: CellStyleData): React.CSSProperties | undefined {
+  if (!s) return undefined;
+  const css: React.CSSProperties = {};
+  if (s.b) css.fontWeight = 'bold';
+  if (s.i) css.fontStyle = 'italic';
+  if (s.u) css.textDecoration = 'underline';
+  if (s.fs) css.fontSize = `${s.fs}px`;
+  if (s.fn) css.fontFamily = s.fn;
+  if (s.fc) css.color = s.fc;
+  if (s.bg) css.backgroundColor = s.bg;
+  if (s.ha) css.textAlign = s.ha as any;
+  if (s.va) css.verticalAlign = s.va === 'center' ? 'middle' : s.va as any;
+  if (s.wt) { css.whiteSpace = 'pre-wrap'; css.wordBreak = 'break-word'; }
+  if (s.ind) css.paddingLeft = `${s.ind * 12}px`;
+  if (s.bt) css.borderTop = s.bt === 'thick' ? '2px solid #000' : s.bt === 'double' ? '3px double #000' : '1px solid #000';
+  if (s.bb) css.borderBottom = s.bb === 'thick' ? '2px solid #000' : s.bb === 'double' ? '3px double #000' : '1px solid #000';
+  if (s.bl) css.borderLeft = s.bl === 'thick' ? '2px solid #000' : '1px solid #000';
+  if (s.br) css.borderRight = s.br === 'thick' ? '2px solid #000' : '1px solid #000';
+  return Object.keys(css).length > 0 ? css : undefined;
+}
+
+const EXCEL_FUNCTIONS = [
+  'SUM','AVERAGE','COUNT','COUNTA','COUNTBLANK','MAX','MIN','IF','IFERROR','IFNA',
+  'VLOOKUP','HLOOKUP','INDEX','MATCH','XLOOKUP','SUMIF','SUMIFS','COUNTIF','COUNTIFS',
+  'AVERAGEIF','AVERAGEIFS','LEFT','RIGHT','MID','LEN','TRIM','UPPER','LOWER','PROPER',
+  'CONCATENATE','TEXTJOIN','SUBSTITUTE','FIND','SEARCH','VALUE','TEXT','DATE','TODAY',
+  'NOW','YEAR','MONTH','DAY','DATEDIF','ROUND','ROUNDUP','ROUNDDOWN','ABS','SQRT',
+  'POWER','MOD','INT','RAND','RANDBETWEEN','AND','OR','NOT','TRUE','FALSE',
+  'PMT','FV','PV','NPV','IRR','RATE','OFFSET','INDIRECT','ROW','COLUMN',
+  'ROWS','COLUMNS','TRANSPOSE','UNIQUE','SORT','FILTER','SEQUENCE','LET','LAMBDA',
+];
 
 interface ExcelViewerProps {
   workbookInfo: WorkbookInfo | null;
@@ -26,7 +85,7 @@ interface ExcelViewerProps {
   onUpload: (f: File) => void;
 }
 
-type ViewTab = 'summary' | 'grid' | 'analysis' | 'audit' | 'compare';
+type ViewTab = 'summary' | 'grid' | 'charts' | 'analysis' | 'audit' | 'compare';
 
 interface DiffCellItem { cell: string; sheet: string; type: string; old_value: unknown; new_value: unknown; delta_pct: number | null; impact: number; }
 interface DiffSheetItem { sheet: string; added: number; removed: number; modified: number; formula_changes: number; value_changes: number; max_delta_pct: number | null; }
@@ -95,7 +154,177 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
   const [sortCol, setSortCol] = useState<number | null>(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
 
+  // ── Multi-cell selection range ──
+  const [selRange, setSelRange] = useState<SelectionRange | null>(null);
+  const isDragging = useRef(false);
+
+  // ── Filtering state ──
+  const [filterCol, setFilterCol] = useState<number | null>(null);
+  const [filterValues, setFilterValues] = useState<Set<string>>(new Set());
+  const [filterOpen, setFilterOpen] = useState<number | null>(null);
+  const filterRef = useRef<HTMLDivElement>(null);
+
+  // ── Freeze panes ──
+  const [freezeRow, setFreezeRow] = useState(0);
+  const [freezeCol, setFreezeCol] = useState(0);
+
+  // ── Formula autocomplete ──
+  const [formulaSuggestions, setFormulaSuggestions] = useState<string[]>([]);
+  const [formulaSugIdx, setFormulaSugIdx] = useState(-1);
+
+  // ── Row heights ──
+  const [rowHeights, setRowHeights] = useState<Record<number, number>>({});
+
+  // ── Conditional formatting rules ──
+  interface CondRule { id: string; type: 'gt' | 'lt' | 'eq' | 'between' | 'text' | 'duplicate' | 'colorScale'; col: number; v1: string; v2?: string; color: string; bgColor: string; }
+  const [condRules, setCondRules] = useState<CondRule[]>([]);
+  const [showCondFmt, setShowCondFmt] = useState(false);
+
+  // ── Cell comments ──
+  const [comments, setComments] = useState<Record<string, string>>({});
+  const [editingComment, setEditingComment] = useState<string | null>(null);
+  const [commentText, setCommentText] = useState('');
+
+  // ── Paste special ──
+  const [showPasteSpecial, setShowPasteSpecial] = useState(false);
+
+  // ── Hidden rows/cols ──
+  const [hiddenRows, setHiddenRows] = useState<Set<number>>(new Set());
+  const [hiddenCols, setHiddenCols] = useState<Set<number>>(new Set());
+
+  // ── Data tools dialogs ──
+  const [showDataValidation, setShowDataValidation] = useState(false);
+  const [showNamedRanges, setShowNamedRanges] = useState(false);
+  const [showGoalSeek, setShowGoalSeek] = useState(false);
+  const [showTextToCol, setShowTextToCol] = useState(false);
+  const [showRemoveDups, setShowRemoveDups] = useState(false);
+  const [namedRangesData, setNamedRangesData] = useState<Record<string, string>>({});
+  const [goalSeekResult, setGoalSeekResult] = useState<string | null>(null);
+  const [dataToolMsg, setDataToolMsg] = useState<string | null>(null);
+
+  // ── Grouping / outlining ──
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+
   const currentSheet = sheets[activeSheet] || null;
+
+  // ── Conditional formatting evaluation ──
+  const evalCondFmt = useCallback((row: number, col: number, value: string): React.CSSProperties | null => {
+    if (condRules.length === 0) return null;
+    const num = parseFloat(value.replace(/[,$%]/g, ''));
+    for (const rule of condRules) {
+      if (rule.col !== -1 && rule.col !== col) continue;
+      let match = false;
+      if (rule.type === 'gt' && !isNaN(num) && num > parseFloat(rule.v1)) match = true;
+      if (rule.type === 'lt' && !isNaN(num) && num < parseFloat(rule.v1)) match = true;
+      if (rule.type === 'eq' && value === rule.v1) match = true;
+      if (rule.type === 'between' && !isNaN(num) && rule.v2) {
+        if (num >= parseFloat(rule.v1) && num <= parseFloat(rule.v2)) match = true;
+      }
+      if (rule.type === 'text' && value.toLowerCase().includes(rule.v1.toLowerCase())) match = true;
+      if (rule.type === 'duplicate') {
+        if (!currentSheet) continue;
+        let count = 0;
+        for (const r of currentSheet.rows) {
+          if (r[col]?.v === value) count++;
+        }
+        if (count > 1) match = true;
+      }
+      if (match) {
+        const css: React.CSSProperties = {};
+        if (rule.bgColor) css.backgroundColor = rule.bgColor;
+        if (rule.color) css.color = rule.color;
+        return css;
+      }
+    }
+    return null;
+  }, [condRules, currentSheet]);
+
+  // ── Selection helpers for multi-cell ──
+  const getSelectedCells = useCallback((): string[] => {
+    if (!currentSheet) return [];
+    if (selRange) {
+      const { r1, c1, r2, c2 } = normalizeRange(selRange);
+      const cells: string[] = [];
+      for (let r = r1; r <= r2; r++) {
+        for (let c = c1; c <= c2; c++) {
+          cells.push(`${currentSheet.name}!${currentSheet.colHeaders[c]}${r + 1}`);
+        }
+      }
+      return cells;
+    }
+    if (selectedCell) {
+      return [`${currentSheet.name}!${currentSheet.colHeaders[selectedCell.col]}${selectedCell.row + 1}`];
+    }
+    return [];
+  }, [currentSheet, selRange, selectedCell]);
+
+  // ── Current style for selection (from first selected cell) ──
+  const currentSelStyle = useMemo((): CellStyleData | null => {
+    if (!currentSheet || !selectedCell) return null;
+    const cell = currentSheet.rows[selectedCell.row]?.[selectedCell.col];
+    return cell?.s || null;
+  }, [currentSheet, selectedCell]);
+
+  // ── Format handler ──
+  const handleFormat = useCallback(async (stylePatch: Partial<CellStyleData>) => {
+    if (!workbookInfo) return;
+    const cells = getSelectedCells();
+    if (cells.length === 0) return;
+    try {
+      await formatCells(workbookInfo.workbook_uuid, cells, stylePatch);
+      fetchGrid(workbookInfo.workbook_uuid);
+    } catch (e) {
+      console.error('Format failed:', e);
+    }
+  }, [workbookInfo, getSelectedCells]);
+
+  // ── Status bar calculations ──
+  const statusBarInfo = useMemo(() => {
+    if (!currentSheet) return null;
+    const cells: number[] = [];
+    let count = 0;
+    if (selRange) {
+      const { r1, c1, r2, c2 } = normalizeRange(selRange);
+      for (let r = r1; r <= r2; r++) {
+        for (let c = c1; c <= c2; c++) {
+          const cell = currentSheet.rows[r]?.[c];
+          if (cell?.v) {
+            count++;
+            const n = parseFloat(cell.v.replace(/[,$%]/g, ''));
+            if (!isNaN(n)) cells.push(n);
+          }
+        }
+      }
+    } else if (selectedCell) {
+      const cell = currentSheet.rows[selectedCell.row]?.[selectedCell.col];
+      if (cell?.v) {
+        count = 1;
+        const n = parseFloat(cell.v.replace(/[,$%]/g, ''));
+        if (!isNaN(n)) cells.push(n);
+      }
+    }
+    if (cells.length === 0) return { count, sum: 0, avg: 0, min: 0, max: 0, numCount: 0 };
+    const sum = cells.reduce((a, b) => a + b, 0);
+    return {
+      count,
+      numCount: cells.length,
+      sum,
+      avg: sum / cells.length,
+      min: Math.min(...cells),
+      max: Math.max(...cells),
+    };
+  }, [currentSheet, selRange, selectedCell]);
+
+  // ── Filtered rows ──
+  const filteredRows = useMemo(() => {
+    if (!currentSheet) return [];
+    if (filterCol === null || filterValues.size === 0) return currentSheet.rows;
+    return currentSheet.rows.filter((row, idx) => {
+      if (idx === 0) return true;
+      const val = row[filterCol]?.v || '';
+      return filterValues.has(val);
+    });
+  }, [currentSheet, filterCol, filterValues]);
 
   const pendingMap = useRef<Map<string, CellChange>>(new Map());
   useEffect(() => {
@@ -407,23 +636,46 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
       if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); return; }
       if (e.key === 'Enter') { e.preventDefault(); commitEdit(1, 0); return; }
       if (e.key === 'Tab') { e.preventDefault(); commitEdit(0, e.shiftKey ? -1 : 1); return; }
-      return; // let other keys go to input
+      return;
     }
 
     // If a cell is selected but not editing
     if (selectedCell) {
       const { row, col } = selectedCell;
-      if (e.key === 'ArrowDown')  { e.preventDefault(); setSelectedCell({ row: Math.min(maxRow, row + 1), col }); return; }
-      if (e.key === 'ArrowUp')    { e.preventDefault(); setSelectedCell({ row: Math.max(0, row - 1), col }); return; }
-      if (e.key === 'ArrowRight') { e.preventDefault(); setSelectedCell({ row, col: Math.min(maxCol, col + 1) }); return; }
-      if (e.key === 'ArrowLeft')  { e.preventDefault(); setSelectedCell({ row, col: Math.max(0, col - 1) }); return; }
-      if (e.key === 'Tab')        { e.preventDefault(); setSelectedCell({ row, col: Math.min(maxCol, col + (e.shiftKey ? -1 : 1)) }); return; }
+      const mod = e.metaKey || e.ctrlKey;
+
+      // Shift+Arrow → extend selection range
+      if (e.shiftKey && ['ArrowDown','ArrowUp','ArrowRight','ArrowLeft'].includes(e.key)) {
+        e.preventDefault();
+        const anchor = selRange ? selRange.start : { row, col };
+        const end = selRange ? { ...selRange.end } : { row, col };
+        if (e.key === 'ArrowDown')  end.row = Math.min(maxRow, end.row + 1);
+        if (e.key === 'ArrowUp')    end.row = Math.max(0, end.row - 1);
+        if (e.key === 'ArrowRight') end.col = Math.min(maxCol, end.col + 1);
+        if (e.key === 'ArrowLeft')  end.col = Math.max(0, end.col - 1);
+        setSelRange({ start: anchor, end });
+        return;
+      }
+
+      // Arrow keys → single cell move (clears range)
+      if (e.key === 'ArrowDown')  { e.preventDefault(); setSelectedCell({ row: Math.min(maxRow, row + 1), col }); setSelRange(null); return; }
+      if (e.key === 'ArrowUp')    { e.preventDefault(); setSelectedCell({ row: Math.max(0, row - 1), col }); setSelRange(null); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); setSelectedCell({ row, col: Math.min(maxCol, col + 1) }); setSelRange(null); return; }
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); setSelectedCell({ row, col: Math.max(0, col - 1) }); setSelRange(null); return; }
+      if (e.key === 'Tab')        { e.preventDefault(); setSelectedCell({ row, col: Math.min(maxCol, col + (e.shiftKey ? -1 : 1)) }); setSelRange(null); return; }
       if (e.key === 'Enter')      { e.preventDefault(); startEditing(row, col); return; }
       if (e.key === 'F2')         { e.preventDefault(); startEditing(row, col); return; }
       if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); startEditing(row, col, ''); return; }
-      if (e.key === 'Escape')     { e.preventDefault(); setSelectedCell(null); return; }
-      // Cmd/Ctrl shortcuts
-      const mod = e.metaKey || e.ctrlKey;
+      if (e.key === 'Escape')     { e.preventDefault(); setSelectedCell(null); setSelRange(null); return; }
+
+      // Ctrl+A → select all
+      if (mod && e.key === 'a') { e.preventDefault(); setSelRange({ start: { row: 0, col: 0 }, end: { row: maxRow, col: maxCol } }); return; }
+
+      // Formatting shortcuts
+      if (mod && e.key === 'b') { e.preventDefault(); handleFormat({ b: !(currentSelStyle?.b) }); return; }
+      if (mod && e.key === 'i') { e.preventDefault(); handleFormat({ i: !(currentSelStyle?.i) }); return; }
+      if (mod && e.key === 'u') { e.preventDefault(); handleFormat({ u: !(currentSelStyle?.u) }); return; }
+
       if (mod && e.key === 'c') { e.preventDefault(); handleCopy(false); return; }
       if (mod && e.key === 'x') { e.preventDefault(); handleCopy(true); return; }
       if (mod && e.key === 'v') { e.preventDefault(); handlePaste(); return; }
@@ -438,7 +690,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
         return;
       }
     }
-  }, [selectedCell, editingCell, editValue, currentSheet, startEditing, cancelEditing, commitEdit, handleCopy, handlePaste, handleUndo, handleRedo]);
+  }, [selectedCell, editingCell, editValue, currentSheet, selRange, currentSelStyle, startEditing, cancelEditing, commitEdit, handleCopy, handlePaste, handleUndo, handleRedo, handleFormat]);
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -502,6 +754,18 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
             {workbookInfo!.anomaly_count} anomalies
           </span>
         )}
+        <button className={styles.toolbar__btn} onClick={() => setShowCondFmt(!showCondFmt)} type="button" title="Conditional Formatting" style={{ marginLeft: 'auto' }}>Cond.Fmt</button>
+        <button className={styles.toolbar__btn} onClick={() => setShowDataValidation(true)} type="button" title="Data Validation">Validation</button>
+        <button className={styles.toolbar__btn} onClick={async () => {
+          if (!workbookInfo) return;
+          const res = await getNamedRanges(workbookInfo.workbook_uuid);
+          setNamedRangesData(res.named_ranges);
+          setShowNamedRanges(true);
+        }} type="button" title="Named Ranges">Names</button>
+        <button className={styles.toolbar__btn} onClick={() => setShowGoalSeek(true)} type="button" title="Goal Seek">Goal Seek</button>
+        <button className={styles.toolbar__btn} onClick={() => setShowTextToCol(true)} type="button" title="Text to Columns">Txt→Col</button>
+        <button className={styles.toolbar__btn} onClick={() => setShowRemoveDups(true)} type="button" title="Remove Duplicates">Rm Dups</button>
+        <button className={styles.toolbar__btn} onClick={() => window.print()} type="button" title="Print / PDF">Print</button>
         <button
           className={styles.toolbar__download}
           onClick={() => downloadWorkbook(workbookInfo!.workbook_uuid)}
@@ -528,6 +792,11 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
           onClick={() => setViewTab('grid')}
           type="button"
         >Grid</button>
+        <button
+          className={`${styles.analysisTab} ${viewTab === 'charts' ? styles['analysisTab--active'] : ''}`}
+          onClick={() => setViewTab('charts')}
+          type="button"
+        >Charts</button>
         <button
           className={`${styles.analysisTab} ${viewTab === 'analysis' ? styles['analysisTab--active'] : ''}`}
           onClick={() => setViewTab('analysis')}
@@ -563,6 +832,20 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
               if (idx >= 0) { setActiveSheet(idx); setViewTab('grid'); }
             }}
           />
+        </div>
+      ) : viewTab === 'charts' ? (
+        <div style={{ flex: 1, overflow: 'auto' }}>
+          {currentSheet ? (
+            <ChartPanel
+              rows={currentSheet.rows}
+              colHeaders={currentSheet.colHeaders}
+              sheetName={currentSheet.name}
+            />
+          ) : (
+            <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+              No sheet data available
+            </div>
+          )}
         </div>
       ) : viewTab === 'compare' ? (
         <div className={styles.auditWrap} style={{ padding: 16 }}>
@@ -723,18 +1006,27 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                 <button
                   key={s.name}
                   className={`${styles.sheetTab} ${i === activeSheet ? styles['sheetTab--active'] : ''}`}
-                  onClick={() => { setActiveSheet(i); setSelectedCell(null); setEditingCell(null); }}
+                  onClick={() => { setActiveSheet(i); setSelectedCell(null); setEditingCell(null); setSelRange(null); }}
                   type="button"
                 >{s.name}</button>
               ))}
             </div>
           )}
 
+          {/* Format Toolbar (Ribbon) */}
+          <FormatToolbar
+            currentStyle={currentSelStyle}
+            hasSelection={!!selectedCell || !!selRange}
+            onFormat={handleFormat}
+          />
+
           {/* Formula bar */}
           {currentSheet && (
             <div className={styles.formulaBar}>
               <span className={styles.formulaBar__addr}>
-                {selectedCell ? getCellAddr(selectedCell.row, selectedCell.col) : ''}
+                {selRange
+                  ? `${currentSheet.colHeaders[normalizeRange(selRange).c1]}${normalizeRange(selRange).r1 + 1}:${currentSheet.colHeaders[normalizeRange(selRange).c2]}${normalizeRange(selRange).r2 + 1}`
+                  : selectedCell ? getCellAddr(selectedCell.row, selectedCell.col) : ''}
               </span>
               <span className={styles.formulaBar__fx}>fx</span>
               <input
@@ -747,10 +1039,23 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                   })() : ''
                 )}
                 onChange={e => {
+                  const val = e.target.value;
                   if (editingCell) {
-                    setEditValue(e.target.value);
+                    setEditValue(val);
+                    if (val.startsWith('=')) {
+                      const match = val.match(/=([A-Z]+)\(?$/i);
+                      if (match) {
+                        const prefix = match[1].toUpperCase();
+                        setFormulaSuggestions(EXCEL_FUNCTIONS.filter(f => f.startsWith(prefix)).slice(0, 8));
+                        setFormulaSugIdx(0);
+                      } else {
+                        setFormulaSuggestions([]);
+                      }
+                    } else {
+                      setFormulaSuggestions([]);
+                    }
                   } else if (selectedCell) {
-                    startEditing(selectedCell.row, selectedCell.col, e.target.value);
+                    startEditing(selectedCell.row, selectedCell.col, val);
                   }
                 }}
                 onFocus={() => {
@@ -759,12 +1064,44 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                   }
                 }}
                 onKeyDown={e => {
+                  if (formulaSuggestions.length > 0) {
+                    if (e.key === 'ArrowDown') { e.preventDefault(); setFormulaSugIdx(i => Math.min(formulaSuggestions.length - 1, i + 1)); return; }
+                    if (e.key === 'ArrowUp') { e.preventDefault(); setFormulaSugIdx(i => Math.max(0, i - 1)); return; }
+                    if (e.key === 'Tab' || e.key === 'Enter') {
+                      if (formulaSugIdx >= 0 && formulaSugIdx < formulaSuggestions.length) {
+                        e.preventDefault();
+                        const fn = formulaSuggestions[formulaSugIdx];
+                        const eqIdx = editValue.lastIndexOf('=');
+                        const newVal = editValue.slice(0, eqIdx + 1) + fn + '(';
+                        setEditValue(newVal);
+                        setFormulaSuggestions([]);
+                        return;
+                      }
+                    }
+                    if (e.key === 'Escape') { setFormulaSuggestions([]); return; }
+                  }
                   if (e.key === 'Enter') { e.preventDefault(); commitEdit(1, 0); }
                   if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); }
                   if (e.key === 'Tab') { e.preventDefault(); commitEdit(0, e.shiftKey ? -1 : 1); }
                 }}
                 readOnly={!editingCell && !selectedCell}
               />
+              {formulaSuggestions.length > 0 && (
+                <div className={styles.formulaSuggestions}>
+                  {formulaSuggestions.map((fn, i) => (
+                    <div
+                      key={fn}
+                      className={`${styles.formulaSuggestion} ${i === formulaSugIdx ? styles['formulaSuggestion--active'] : ''}`}
+                      onMouseDown={e => {
+                        e.preventDefault();
+                        const eqIdx = editValue.lastIndexOf('=');
+                        setEditValue(editValue.slice(0, eqIdx + 1) + fn + '(');
+                        setFormulaSuggestions([]);
+                      }}
+                    >{fn}</div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -808,6 +1145,8 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
             ref={gridWrapRef}
             tabIndex={0}
             onKeyDown={handleGridKeyDown}
+            onMouseUp={() => { isDragging.current = false; }}
+            onMouseLeave={() => { isDragging.current = false; }}
           >
             {loadingGrid ? (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 10, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
@@ -819,27 +1158,81 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                 <thead>
                   <tr>
                     <th className={styles.grid__rowNum}>#</th>
-                    {currentSheet.colHeaders.map((h, ci) => (
+                    {currentSheet.colHeaders.map((h, ci) => {
+                      if (hiddenCols.has(ci)) return null;
+                      return (
                       <th
                         key={h}
-                        className={`${selectedCell?.col === ci ? styles['grid__colHeader--selected'] : ''} ${sortCol === ci ? styles['grid__colHeader--sorted'] : ''}`}
+                        className={`${selectedCell?.col === ci || isCellInSelection(0, ci, selRange) ? styles['grid__colHeader--selected'] : ''} ${sortCol === ci ? styles['grid__colHeader--sorted'] : ''}`}
                         style={colWidths[ci] ? { width: colWidths[ci], minWidth: colWidths[ci], maxWidth: colWidths[ci] } : undefined}
                         onClick={() => handleSort(ci, sortCol === ci && sortDir === 'asc' ? 'desc' : 'asc')}
                       >
                         {h}
                         {sortCol === ci && <span className={styles.grid__sortIcon}>{sortDir === 'asc' ? ' ▲' : ' ▼'}</span>}
+                        {filterCol === ci && <span className={styles.grid__filterIcon}>▾</span>}
+                        <span
+                          className={styles.grid__filterBtn}
+                          onClick={e => { e.stopPropagation(); setFilterOpen(filterOpen === ci ? null : ci); }}
+                          title="Filter"
+                        >▼</span>
+                        {filterOpen === ci && (
+                          <div className={styles.filterDropdown} ref={filterRef} onClick={e => e.stopPropagation()}>
+                            <div className={styles.filterDropdown__header}>
+                              <button className={styles.findBar__btn} onClick={() => { setFilterCol(null); setFilterValues(new Set()); setFilterOpen(null); }} type="button">Clear</button>
+                              <button className={styles.findBar__btn} onClick={() => setFilterOpen(null)} type="button">✕</button>
+                            </div>
+                            <div className={styles.filterDropdown__list}>
+                              {(() => {
+                                const vals = new Set<string>();
+                                currentSheet.rows.forEach((row, ri) => { if (ri > 0 && row[ci]?.v) vals.add(row[ci].v); });
+                                return [...vals].sort().map(val => (
+                                  <label key={val} className={styles.filterDropdown__item}>
+                                    <input
+                                      type="checkbox"
+                                      checked={filterCol === ci ? filterValues.has(val) : true}
+                                      onChange={e => {
+                                        const newVals = new Set(filterCol === ci ? filterValues : vals);
+                                        if (e.target.checked) newVals.add(val); else newVals.delete(val);
+                                        setFilterCol(ci);
+                                        setFilterValues(newVals);
+                                      }}
+                                    />
+                                    <span>{val || '(blank)'}</span>
+                                  </label>
+                                ));
+                              })()}
+                            </div>
+                          </div>
+                        )}
                         <span
                           className={styles.grid__resizeHandle}
                           onMouseDown={e => handleResizeStart(e, ci)}
+                          onDoubleClick={e => {
+                            e.stopPropagation();
+                            let maxW = 60;
+                            currentSheet.rows.forEach(row => {
+                              const v = row[ci]?.v || '';
+                              maxW = Math.max(maxW, v.length * 8 + 16);
+                            });
+                            setColWidths(prev => ({ ...prev, [ci]: Math.min(maxW, 400) }));
+                          }}
                         />
                       </th>
-                    ))}
+                      );
+                    })}
                   </tr>
                 </thead>
                 <tbody>
                   {sortedRows.map((row, r) => (
-                    <tr key={r}>
-                      <td className={`${styles.grid__rowNum} ${selectedCell?.row === r ? styles['grid__rowNum--selected'] : ''}`}>{r + 1}</td>
+                    <tr key={r} style={rowHeights[r] ? { height: rowHeights[r] } : undefined}>
+                      <td
+                        className={`${styles.grid__rowNum} ${selectedCell?.row === r || isCellInSelection(r, 0, selRange) ? styles['grid__rowNum--selected'] : ''}`}
+                        onMouseDown={() => {
+                          const maxCol = currentSheet.colHeaders.length - 1;
+                          setSelectedCell({ row: r, col: 0 });
+                          setSelRange({ start: { row: r, col: 0 }, end: { row: r, col: maxCol } });
+                        }}
+                      >{r + 1}</td>
                       {row.map((cell, c) => {
                         const colLtr = currentSheet.colHeaders[c] || '';
                         const addr = `${currentSheet.name}!${colLtr}${r + 1}`;
@@ -851,8 +1244,11 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                         const isNum = isNumeric(cell.v);
                         const isHeader = r === 0 && !isFormula && !isEmpty;
                         const isSel = selectedCell?.row === r && selectedCell?.col === c;
+                        const isInRange = isCellInSelection(r, c, selRange);
                         const isEditing = editingCell?.row === r && editingCell?.col === c;
                         const isFindMatch = findMatches.some(m => m.row === r && m.col === c);
+                        const isMergedSlave = !!cell.mm;
+                        if (isMergedSlave) return null;
                         const cls = [
                           styles.grid__cell,
                           isFormula ? styles['grid__cell--formula'] : styles['grid__cell--hardcoded'],
@@ -862,21 +1258,38 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                           isAnomaly ? styles['grid__cell--anomaly'] : '',
                           isPending ? styles['grid__cell--pending'] : '',
                           isSel && !isEditing ? styles['grid__cell--selected'] : '',
+                          isInRange && !isSel ? styles['grid__cell--inRange'] : '',
                           isEditing ? styles['grid__cell--editing'] : '',
                           isFindMatch ? styles['grid__cell--findMatch'] : '',
-                          selectedCell && !isSel && selectedCell.col === c ? styles.grid__colHighlight : '',
-                          selectedCell && !isSel && selectedCell.row === r ? styles.grid__rowHighlight : '',
+                          !isSel && !isInRange && selectedCell?.col === c ? styles.grid__colHighlight : '',
+                          !isSel && !isInRange && selectedCell?.row === r ? styles.grid__rowHighlight : '',
                         ].filter(Boolean).join(' ');
+                        const cellCss = cellStyleToCSS(cell.s);
+                        const condCss = evalCondFmt(r, c, cell.v);
+                        const widthStyle = colWidths[c] ? { width: colWidths[c], minWidth: colWidths[c], maxWidth: colWidths[c] } : undefined;
+                        const mergedStyle = { ...widthStyle, ...cellCss, ...condCss };
+                        const hasComment = !!comments[addr];
                         return (
                           <td
                             key={c}
                             className={cls}
-                            style={colWidths[c] ? { width: colWidths[c], minWidth: colWidths[c], maxWidth: colWidths[c] } : undefined}
+                            style={mergedStyle}
                             title={isPending ? `${formatDiffVal(pending.before)} → ${formatDiffVal(pending.after)}` : (cell.nr ? `Named: ${cell.nr}` : cell.v)}
-                            onClick={() => {
+                            onMouseDown={e => {
                               if (isEditing) return;
-                              setSelectedCell({ row: r, col: c });
+                              if (e.shiftKey && selectedCell) {
+                                setSelRange({ start: { row: selectedCell.row, col: selectedCell.col }, end: { row: r, col: c } });
+                              } else {
+                                setSelectedCell({ row: r, col: c });
+                                setSelRange(null);
+                                isDragging.current = true;
+                              }
                               if (editingCell) commitEdit();
+                            }}
+                            onMouseEnter={() => {
+                              if (isDragging.current && selectedCell) {
+                                setSelRange({ start: { row: selectedCell.row, col: selectedCell.col }, end: { row: r, col: c } });
+                              }
                             }}
                             onDoubleClick={() => startEditing(r, c)}
                             onContextMenu={e => handleContextMenu(e, r, c)}
@@ -885,8 +1298,34 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                               <input
                                 ref={cellEditRef}
                                 value={editValue}
-                                onChange={e => setEditValue(e.target.value)}
+                                onChange={e => {
+                                  setEditValue(e.target.value);
+                                  if (e.target.value.startsWith('=')) {
+                                    const match = e.target.value.match(/=([A-Z]+)\(?$/i);
+                                    if (match) {
+                                      const prefix = match[1].toUpperCase();
+                                      setFormulaSuggestions(EXCEL_FUNCTIONS.filter(f => f.startsWith(prefix)).slice(0, 8));
+                                      setFormulaSugIdx(0);
+                                    } else {
+                                      setFormulaSuggestions([]);
+                                    }
+                                  }
+                                }}
                                 onKeyDown={e => {
+                                  if (formulaSuggestions.length > 0) {
+                                    if (e.key === 'ArrowDown') { e.preventDefault(); setFormulaSugIdx(i => Math.min(formulaSuggestions.length - 1, i + 1)); return; }
+                                    if (e.key === 'ArrowUp') { e.preventDefault(); setFormulaSugIdx(i => Math.max(0, i - 1)); return; }
+                                    if (e.key === 'Tab') {
+                                      if (formulaSugIdx >= 0) {
+                                        e.preventDefault();
+                                        const fn = formulaSuggestions[formulaSugIdx];
+                                        const eqIdx = editValue.lastIndexOf('=');
+                                        setEditValue(editValue.slice(0, eqIdx + 1) + fn + '(');
+                                        setFormulaSuggestions([]);
+                                        return;
+                                      }
+                                    }
+                                  }
                                   if (e.key === 'Enter') { e.preventDefault(); commitEdit(1, 0); }
                                   if (e.key === 'Tab') { e.preventDefault(); commitEdit(0, e.shiftKey ? -1 : 1); }
                                   if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); }
@@ -903,7 +1342,32 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                                 <span className={styles['cellOld']}>{formatDiffVal(pending.before)}</span>
                                 <span className={styles['cellNew']}>{formatDiffVal(pending.after)}</span>
                               </>
+                            ) : /^https?:\/\//i.test(cell.v) ? (
+                              <a
+                                href={cell.v}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className={styles['grid__cell--link']}
+                                onClick={e => e.stopPropagation()}
+                              >{cell.v}</a>
                             ) : cell.v}
+                            {hasComment && <span className={styles.commentIndicator} title={comments[addr]} />}
+                            {formulaSuggestions.length > 0 && isEditing && (
+                              <div className={styles.formulaSuggestions} style={{ position: 'absolute', top: '100%', left: 0, zIndex: 100 }}>
+                                {formulaSuggestions.map((fn, i) => (
+                                  <div
+                                    key={fn}
+                                    className={`${styles.formulaSuggestion} ${i === formulaSugIdx ? styles['formulaSuggestion--active'] : ''}`}
+                                    onMouseDown={e => {
+                                      e.preventDefault();
+                                      const eqIdx = editValue.lastIndexOf('=');
+                                      setEditValue(editValue.slice(0, eqIdx + 1) + fn + '(');
+                                      setFormulaSuggestions([]);
+                                    }}
+                                  >{fn}</div>
+                                ))}
+                              </div>
+                            )}
                           </td>
                         );
                       })}
@@ -933,10 +1397,60 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                 Paste
                 <span className={styles.ctxMenu__shortcut}>⌘V</span>
               </button>
+              <button className={styles.ctxMenu__item} onClick={async () => {
+                if (!selectedCell || !workbookInfo || !currentSheet) { setCtxMenu(null); return; }
+                let val = '';
+                try { val = await navigator.clipboard.readText(); } catch { setCtxMenu(null); return; }
+                const numVal = parseFloat(val.replace(/[,$%]/g, ''));
+                const addr = getCellAddr(selectedCell.row, selectedCell.col);
+                const oldCell = getRawCell(selectedCell.row, selectedCell.col);
+                pushUndo(addr, currentSheet.name, oldCell?.v ?? '', isNaN(numVal) ? val : String(numVal));
+                await editCell(workbookInfo.workbook_uuid, currentSheet.name, addr, isNaN(numVal) ? val : String(numVal));
+                fetchGrid(workbookInfo.workbook_uuid);
+                setCtxMenu(null);
+              }} type="button">Paste values only</button>
               <div className={styles.ctxMenu__sep} />
               <button className={styles.ctxMenu__item} onClick={() => { startEditing(ctxMenu.row, ctxMenu.col, ''); setCtxMenu(null); }} type="button">
                 Clear cell
               </button>
+              <div className={styles.ctxMenu__sep} />
+              <button className={styles.ctxMenu__item} onClick={async () => {
+                if (!workbookInfo || !currentSheet) return;
+                await insertRow(workbookInfo.workbook_uuid, currentSheet.name, ctxMenu.row + 1);
+                fetchGrid(workbookInfo.workbook_uuid);
+                setCtxMenu(null);
+              }} type="button">Insert row above</button>
+              <button className={styles.ctxMenu__item} onClick={async () => {
+                if (!workbookInfo || !currentSheet) return;
+                await insertRow(workbookInfo.workbook_uuid, currentSheet.name, ctxMenu.row + 2);
+                fetchGrid(workbookInfo.workbook_uuid);
+                setCtxMenu(null);
+              }} type="button">Insert row below</button>
+              <button className={styles.ctxMenu__item} onClick={async () => {
+                if (!workbookInfo || !currentSheet) return;
+                await insertCol(workbookInfo.workbook_uuid, currentSheet.name, ctxMenu.col + 1);
+                fetchGrid(workbookInfo.workbook_uuid);
+                setCtxMenu(null);
+              }} type="button">Insert column left</button>
+              <button className={styles.ctxMenu__item} onClick={async () => {
+                if (!workbookInfo || !currentSheet) return;
+                await insertCol(workbookInfo.workbook_uuid, currentSheet.name, ctxMenu.col + 2);
+                fetchGrid(workbookInfo.workbook_uuid);
+                setCtxMenu(null);
+              }} type="button">Insert column right</button>
+              <div className={styles.ctxMenu__sep} />
+              <button className={styles.ctxMenu__item} onClick={async () => {
+                if (!workbookInfo || !currentSheet) return;
+                await deleteRow(workbookInfo.workbook_uuid, currentSheet.name, ctxMenu.row + 1);
+                fetchGrid(workbookInfo.workbook_uuid);
+                setCtxMenu(null);
+              }} type="button" style={{ color: '#DC2626' }}>Delete row</button>
+              <button className={styles.ctxMenu__item} onClick={async () => {
+                if (!workbookInfo || !currentSheet) return;
+                await deleteCol(workbookInfo.workbook_uuid, currentSheet.name, ctxMenu.col + 1);
+                fetchGrid(workbookInfo.workbook_uuid);
+                setCtxMenu(null);
+              }} type="button" style={{ color: '#DC2626' }}>Delete column</button>
               <div className={styles.ctxMenu__sep} />
               <button className={styles.ctxMenu__item} onClick={() => handleSort(ctxMenu.col, 'asc')} type="button">
                 Sort A → Z
@@ -944,6 +1458,281 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
               <button className={styles.ctxMenu__item} onClick={() => handleSort(ctxMenu.col, 'desc')} type="button">
                 Sort Z → A
               </button>
+              <div className={styles.ctxMenu__sep} />
+              <button className={styles.ctxMenu__item} onClick={() => { setFreezeRow(ctxMenu.row + 1); setFreezeCol(ctxMenu.col + 1); setCtxMenu(null); }} type="button">
+                Freeze panes here
+              </button>
+              <button className={styles.ctxMenu__item} onClick={() => { setFreezeRow(0); setFreezeCol(0); setCtxMenu(null); }} type="button">
+                Unfreeze panes
+              </button>
+              <div className={styles.ctxMenu__sep} />
+              <button className={styles.ctxMenu__item} onClick={() => {
+                const addr = `${currentSheet?.name}!${currentSheet?.colHeaders[ctxMenu.col]}${ctxMenu.row + 1}`;
+                setEditingComment(addr);
+                setCommentText(comments[addr] || '');
+                setCtxMenu(null);
+              }} type="button">{comments[`${currentSheet?.name}!${currentSheet?.colHeaders[ctxMenu.col]}${ctxMenu.row + 1}`] ? 'Edit comment' : 'Add comment'}</button>
+              {comments[`${currentSheet?.name}!${currentSheet?.colHeaders[ctxMenu.col]}${ctxMenu.row + 1}`] && (
+                <button className={styles.ctxMenu__item} onClick={() => {
+                  const addr = `${currentSheet?.name}!${currentSheet?.colHeaders[ctxMenu.col]}${ctxMenu.row + 1}`;
+                  setComments(prev => { const n = { ...prev }; delete n[addr]; return n; });
+                  setCtxMenu(null);
+                }} type="button" style={{ color: '#DC2626' }}>Delete comment</button>
+              )}
+              <div className={styles.ctxMenu__sep} />
+              <button className={styles.ctxMenu__item} onClick={() => {
+                setHiddenRows(prev => new Set([...prev, ctxMenu.row]));
+                setCtxMenu(null);
+              }} type="button">Hide row</button>
+              <button className={styles.ctxMenu__item} onClick={() => {
+                setHiddenCols(prev => new Set([...prev, ctxMenu.col]));
+                setCtxMenu(null);
+              }} type="button">Hide column</button>
+              {(hiddenRows.size > 0 || hiddenCols.size > 0) && (
+                <button className={styles.ctxMenu__item} onClick={() => {
+                  setHiddenRows(new Set());
+                  setHiddenCols(new Set());
+                  setCtxMenu(null);
+                }} type="button">Unhide all</button>
+              )}
+            </div>
+          )}
+
+          {/* Comment editor */}
+          {editingComment && (
+            <div className={styles.commentEditor}>
+              <div className={styles.commentEditor__header}>
+                <span>Comment: {editingComment}</span>
+                <button onClick={() => setEditingComment(null)} type="button">✕</button>
+              </div>
+              <textarea
+                className={styles.commentEditor__input}
+                value={commentText}
+                onChange={e => setCommentText(e.target.value)}
+                autoFocus
+                rows={3}
+              />
+              <div className={styles.commentEditor__actions}>
+                <button className={styles.findBar__btn} onClick={() => {
+                  if (commentText.trim()) {
+                    setComments(prev => ({ ...prev, [editingComment]: commentText.trim() }));
+                  } else {
+                    setComments(prev => { const n = { ...prev }; delete n[editingComment]; return n; });
+                  }
+                  setEditingComment(null);
+                }} type="button">Save</button>
+                <button className={styles.findBar__btn} onClick={() => setEditingComment(null)} type="button">Cancel</button>
+              </div>
+            </div>
+          )}
+
+          {/* Conditional Formatting panel */}
+          {showCondFmt && (
+            <div className={styles.condFmtPanel}>
+              <div className={styles.condFmtPanel__header}>
+                <span>Conditional Formatting Rules</span>
+                <button onClick={() => setShowCondFmt(false)} type="button">✕</button>
+              </div>
+              {condRules.map(rule => (
+                <div key={rule.id} className={styles.condFmtRule}>
+                  <span style={{ backgroundColor: rule.bgColor, color: rule.color, padding: '1px 6px', borderRadius: 2, fontSize: 10 }}>
+                    {rule.type === 'gt' ? `> ${rule.v1}` : rule.type === 'lt' ? `< ${rule.v1}` : rule.type === 'eq' ? `= ${rule.v1}` :
+                     rule.type === 'between' ? `${rule.v1} – ${rule.v2}` : rule.type === 'text' ? `"${rule.v1}"` : rule.type === 'duplicate' ? 'Duplicates' : 'Color Scale'}
+                  </span>
+                  <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Col: {rule.col === -1 ? 'All' : currentSheet?.colHeaders[rule.col] || rule.col}</span>
+                  <button onClick={() => setCondRules(prev => prev.filter(r => r.id !== rule.id))} type="button" style={{ background: 'none', border: 'none', color: '#DC2626', cursor: 'pointer', fontSize: 11 }}>✕</button>
+                </div>
+              ))}
+              <div className={styles.condFmtAdd}>
+                <select id="cfType" className={styles.condFmtSelect}><option value="gt">&gt;</option><option value="lt">&lt;</option><option value="eq">=</option><option value="between">Between</option><option value="text">Contains</option><option value="duplicate">Duplicates</option></select>
+                <input id="cfV1" placeholder="Value" className={styles.condFmtInput} />
+                <input id="cfV2" placeholder="Value 2" className={styles.condFmtInput} style={{ width: 50 }} />
+                <input id="cfBg" type="color" defaultValue="#FECACA" style={{ width: 24, height: 24, border: 'none', cursor: 'pointer' }} />
+                <input id="cfFc" type="color" defaultValue="#DC2626" style={{ width: 24, height: 24, border: 'none', cursor: 'pointer' }} />
+                <button className={styles.findBar__btn} onClick={() => {
+                  const type = (document.getElementById('cfType') as HTMLSelectElement).value as CondRule['type'];
+                  const v1 = (document.getElementById('cfV1') as HTMLInputElement).value;
+                  const v2 = (document.getElementById('cfV2') as HTMLInputElement).value;
+                  const bgColor = (document.getElementById('cfBg') as HTMLInputElement).value;
+                  const color = (document.getElementById('cfFc') as HTMLInputElement).value;
+                  if (!v1 && type !== 'duplicate') return;
+                  setCondRules(prev => [...prev, { id: Date.now().toString(), type, col: selectedCell?.col ?? -1, v1, v2, bgColor, color }]);
+                }} type="button">Add</button>
+              </div>
+            </div>
+          )}
+
+          {/* Data Validation dialog */}
+          {showDataValidation && (
+            <div className={styles.condFmtPanel}>
+              <div className={styles.condFmtPanel__header}>
+                <span>Data Validation</span>
+                <button onClick={() => setShowDataValidation(false)} type="button">✕</button>
+              </div>
+              <div className={styles.condFmtAdd} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Type</label>
+                <select id="dvType" className={styles.condFmtSelect} style={{ width: '100%' }}>
+                  <option value="list">Dropdown List</option>
+                  <option value="number">Number Range</option>
+                  <option value="text_length">Text Length</option>
+                </select>
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Values (comma-separated for list)</label>
+                <input id="dvValues" className={styles.condFmtInput} style={{ width: '100%' }} placeholder="e.g. Yes,No,Maybe" />
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Min / Max (for number)</label>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <input id="dvMin" className={styles.condFmtInput} placeholder="Min" style={{ width: 80 }} />
+                  <input id="dvMax" className={styles.condFmtInput} placeholder="Max" style={{ width: 80 }} />
+                </div>
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Input message</label>
+                <input id="dvMsg" className={styles.condFmtInput} style={{ width: '100%' }} placeholder="Help text..." />
+                <button className={styles.findBar__btn} onClick={async () => {
+                  if (!workbookInfo) return;
+                  const cells = getSelectedCells();
+                  if (cells.length === 0) { setDataToolMsg('Select cells first'); return; }
+                  const type = (document.getElementById('dvType') as HTMLSelectElement).value as 'list' | 'number' | 'text_length';
+                  const valStr = (document.getElementById('dvValues') as HTMLInputElement).value;
+                  const min = parseFloat((document.getElementById('dvMin') as HTMLInputElement).value) || undefined;
+                  const max = parseFloat((document.getElementById('dvMax') as HTMLInputElement).value) || undefined;
+                  const message = (document.getElementById('dvMsg') as HTMLInputElement).value;
+                  await setDataValidation(workbookInfo.workbook_uuid, cells, {
+                    type, values: valStr ? valStr.split(',').map(s => s.trim()) : [], min, max, message,
+                  });
+                  setDataToolMsg(`Validation set on ${cells.length} cell(s)`);
+                  setShowDataValidation(false);
+                }} type="button" style={{ marginTop: 4 }}>Apply Validation</button>
+              </div>
+            </div>
+          )}
+
+          {/* Named Ranges dialog */}
+          {showNamedRanges && (
+            <div className={styles.condFmtPanel}>
+              <div className={styles.condFmtPanel__header}>
+                <span>Named Ranges</span>
+                <button onClick={() => setShowNamedRanges(false)} type="button">✕</button>
+              </div>
+              {Object.entries(namedRangesData).map(([name, range]) => (
+                <div key={name} className={styles.condFmtRule}>
+                  <span style={{ fontWeight: 600, fontSize: 11 }}>{name}</span>
+                  <span style={{ fontSize: 10, color: 'var(--text-muted)', flex: 1 }}>{range}</span>
+                  <button onClick={async () => {
+                    if (!workbookInfo) return;
+                    await deleteNamedRange(workbookInfo.workbook_uuid, name);
+                    setNamedRangesData(prev => { const n = { ...prev }; delete n[name]; return n; });
+                  }} type="button" style={{ background: 'none', border: 'none', color: '#DC2626', cursor: 'pointer', fontSize: 11 }}>✕</button>
+                </div>
+              ))}
+              <div className={styles.condFmtAdd}>
+                <input id="nrName" className={styles.condFmtInput} placeholder="Name" style={{ width: 80 }} />
+                <input id="nrRange" className={styles.condFmtInput} placeholder="Sheet1!A1:B10" style={{ width: 120 }} />
+                <button className={styles.findBar__btn} onClick={async () => {
+                  if (!workbookInfo) return;
+                  const name = (document.getElementById('nrName') as HTMLInputElement).value.trim();
+                  const range = (document.getElementById('nrRange') as HTMLInputElement).value.trim();
+                  if (!name || !range) return;
+                  await setNamedRange(workbookInfo.workbook_uuid, name, range);
+                  setNamedRangesData(prev => ({ ...prev, [name]: range }));
+                  (document.getElementById('nrName') as HTMLInputElement).value = '';
+                  (document.getElementById('nrRange') as HTMLInputElement).value = '';
+                }} type="button">Add</button>
+              </div>
+            </div>
+          )}
+
+          {/* Goal Seek dialog */}
+          {showGoalSeek && (
+            <div className={styles.condFmtPanel}>
+              <div className={styles.condFmtPanel__header}>
+                <span>Goal Seek</span>
+                <button onClick={() => { setShowGoalSeek(false); setGoalSeekResult(null); }} type="button">✕</button>
+              </div>
+              <div className={styles.condFmtAdd} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Target cell (e.g. Sheet1!B10)</label>
+                <input id="gsTarget" className={styles.condFmtInput} style={{ width: '100%' }} placeholder="Sheet1!B10" />
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Goal value</label>
+                <input id="gsGoal" className={styles.condFmtInput} style={{ width: '100%' }} placeholder="1000" />
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Changing cell (e.g. Sheet1!A1)</label>
+                <input id="gsChanging" className={styles.condFmtInput} style={{ width: '100%' }} placeholder="Sheet1!A1" />
+                <button className={styles.findBar__btn} onClick={async () => {
+                  if (!workbookInfo) return;
+                  const target = (document.getElementById('gsTarget') as HTMLInputElement).value.trim();
+                  const goal = parseFloat((document.getElementById('gsGoal') as HTMLInputElement).value);
+                  const changing = (document.getElementById('gsChanging') as HTMLInputElement).value.trim();
+                  if (!target || isNaN(goal) || !changing) return;
+                  try {
+                    const res = await goalSeek(workbookInfo.workbook_uuid, target, goal, changing);
+                    setGoalSeekResult(`Result: ${res.result_value.toFixed(4)} (achieved: ${res.achieved_value}, diff: ${res.difference.toFixed(6)})`);
+                    fetchGrid(workbookInfo.workbook_uuid);
+                  } catch (e) {
+                    setGoalSeekResult(`Error: ${e instanceof Error ? e.message : 'Failed'}`);
+                  }
+                }} type="button">Seek</button>
+                {goalSeekResult && <div style={{ fontSize: 11, color: 'var(--text-primary)', marginTop: 4 }}>{goalSeekResult}</div>}
+              </div>
+            </div>
+          )}
+
+          {/* Text to Columns dialog */}
+          {showTextToCol && (
+            <div className={styles.condFmtPanel}>
+              <div className={styles.condFmtPanel__header}>
+                <span>Text to Columns</span>
+                <button onClick={() => setShowTextToCol(false)} type="button">✕</button>
+              </div>
+              <div className={styles.condFmtAdd} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Select a column in the grid, then choose delimiter</label>
+                <select id="ttcDelim" className={styles.condFmtSelect} style={{ width: '100%' }}>
+                  <option value=",">Comma (,)</option>
+                  <option value=";">Semicolon (;)</option>
+                  <option value=" ">Space</option>
+                  <option value="\t">Tab</option>
+                  <option value="|">Pipe (|)</option>
+                  <option value="-">Dash (-)</option>
+                </select>
+                <button className={styles.findBar__btn} onClick={async () => {
+                  if (!workbookInfo || !currentSheet || selectedCell === null) { setDataToolMsg('Select a cell in the column first'); return; }
+                  const delimiter = (document.getElementById('ttcDelim') as HTMLSelectElement).value;
+                  try {
+                    const res = await textToColumns(workbookInfo.workbook_uuid, currentSheet.name, selectedCell.col + 1, delimiter);
+                    setDataToolMsg(`Split into ${res.split_into_columns} columns (${res.cells_written} cells)`);
+                    fetchGrid(workbookInfo.workbook_uuid);
+                    setShowTextToCol(false);
+                  } catch (e) {
+                    setDataToolMsg(`Error: ${e instanceof Error ? e.message : 'Failed'}`);
+                  }
+                }} type="button">Split</button>
+              </div>
+            </div>
+          )}
+
+          {/* Remove Duplicates dialog */}
+          {showRemoveDups && (
+            <div className={styles.condFmtPanel}>
+              <div className={styles.condFmtPanel__header}>
+                <span>Remove Duplicates</span>
+                <button onClick={() => setShowRemoveDups(false)} type="button">✕</button>
+              </div>
+              <div className={styles.condFmtAdd} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 6 }}>
+                <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>Removes duplicate rows (keeps first occurrence). Compares all columns.</label>
+                <button className={styles.findBar__btn} onClick={async () => {
+                  if (!workbookInfo || !currentSheet) return;
+                  try {
+                    const res = await removeDuplicates(workbookInfo.workbook_uuid, currentSheet.name);
+                    setDataToolMsg(`Removed ${res.removed} duplicate row(s). ${res.remaining_rows} rows remaining.`);
+                    fetchGrid(workbookInfo.workbook_uuid);
+                    setShowRemoveDups(false);
+                  } catch (e) {
+                    setDataToolMsg(`Error: ${e instanceof Error ? e.message : 'Failed'}`);
+                  }
+                }} type="button" style={{ color: '#DC2626' }}>Remove Duplicates Now</button>
+              </div>
+            </div>
+          )}
+
+          {/* Data tool message toast */}
+          {dataToolMsg && (
+            <div className={styles.dataToolToast} onClick={() => setDataToolMsg(null)}>
+              {dataToolMsg}
             </div>
           )}
 
@@ -964,28 +1753,32 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
             </div>
           )}
 
-          {/* Legend */}
-          <div className={styles.legend}>
-            <div className={styles.legend__item}>
-              <div className={`${styles.legend__dot} ${styles['legend__dot--formula']}`} />
-              <span>Formula</span>
+          {/* Status bar */}
+          <div className={styles.statusBar}>
+            <div className={styles.statusBar__left}>
+              {selectedCell && (
+                <span>
+                  {selRange
+                    ? `${normalizeRange(selRange).r2 - normalizeRange(selRange).r1 + 1}R × ${normalizeRange(selRange).c2 - normalizeRange(selRange).c1 + 1}C`
+                    : getCellAddr(selectedCell.row, selectedCell.col)}
+                </span>
+              )}
+              {freezeRow > 0 && <span className={styles.statusBar__badge}>Frozen {freezeRow}R {freezeCol}C</span>}
             </div>
-            <div className={styles.legend__item}>
-              <div className={`${styles.legend__dot} ${styles['legend__dot--hardcoded']}`} />
-              <span>Value</span>
+            <div className={styles.statusBar__right}>
+              {statusBarInfo && statusBarInfo.numCount > 0 && (
+                <>
+                  <span>Sum: <strong>{statusBarInfo.sum.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></span>
+                  <span>Avg: <strong>{statusBarInfo.avg.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></span>
+                  <span>Count: <strong>{statusBarInfo.count}</strong></span>
+                  <span>Min: <strong>{statusBarInfo.min.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></span>
+                  <span>Max: <strong>{statusBarInfo.max.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong></span>
+                </>
+              )}
+              {statusBarInfo && statusBarInfo.numCount === 0 && statusBarInfo.count > 0 && (
+                <span>Count: <strong>{statusBarInfo.count}</strong></span>
+              )}
             </div>
-            {anomalyCells.size > 0 && (
-              <div className={styles.legend__item}>
-                <div className={`${styles.legend__dot} ${styles['legend__dot--anomaly']}`} />
-                <span>Anomaly ({anomalyCells.size})</span>
-              </div>
-            )}
-            {pendingChanges.length > 0 && (
-              <div className={styles.legend__item}>
-                <div className={`${styles.legend__dot} ${styles['legend__dot--changed']}`} />
-                <span>Pending ({pendingChanges.length})</span>
-              </div>
-            )}
           </div>
         </>
       )}

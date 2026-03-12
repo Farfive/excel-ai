@@ -706,3 +706,355 @@ thead .grid__rowNum {
   color: var(--green);
   background: rgba(34, 197, 94, 0.06);
 }
+
+/* ── Multi-cell selection range ─────────────────────────────── */
+.grid__cell--inRange {
+  background: rgba(37, 99, 235, 0.10) !important;
+  outline: none;
+}
+
+/* ── Status bar ─────────────────────────────────────────────── */
+.statusBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 12px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  min-height: 24px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.statusBar__left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.statusBar__right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.statusBar__right strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.statusBar__badge {
+  padding: 1px 6px;
+  background: rgba(37, 99, 235, 0.1);
+  border: 1px solid rgba(37, 99, 235, 0.2);
+  border-radius: 3px;
+  font-size: 9px;
+  color: #2563EB;
+}
+
+/* ── Formula suggestions dropdown ───────────────────────────── */
+.formulaSuggestions {
+  position: absolute;
+  top: 100%;
+  left: 72px;
+  z-index: 200;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+  max-height: 200px;
+  overflow-y: auto;
+  min-width: 160px;
+}
+
+.formulaSuggestion {
+  padding: 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.formulaSuggestion:hover {
+  background: var(--bg-hover);
+}
+
+.formulaSuggestion--active {
+  background: rgba(37, 99, 235, 0.12);
+  color: #2563EB;
+}
+
+/* ── Comment indicator ──────────────────────────────────────── */
+.commentIndicator {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-top: 6px solid #F97316;
+  pointer-events: none;
+}
+
+/* ── Comment editor ─────────────────────────────────────────── */
+.commentEditor {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.16);
+  padding: 12px;
+  min-width: 280px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.commentEditor__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.commentEditor__header button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.commentEditor__input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text-primary);
+  resize: vertical;
+  outline: none;
+}
+
+.commentEditor__input:focus { border-color: #2563EB; }
+
+.commentEditor__actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  justify-content: flex-end;
+}
+
+/* ── Conditional Formatting panel ───────────────────────────── */
+.condFmtPanel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.16);
+  padding: 12px;
+  min-width: 360px;
+  max-height: 400px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.condFmtPanel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.condFmtPanel__header button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.condFmtRule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.condFmtAdd {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.condFmtSelect {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text-primary);
+}
+
+.condFmtInput {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text-primary);
+  width: 60px;
+  outline: none;
+}
+
+.condFmtInput:focus { border-color: #2563EB; }
+
+/* ── Filter button & dropdown ───────────────────────────────── */
+.grid__filterBtn {
+  position: absolute;
+  top: 2px;
+  right: 8px;
+  font-size: 7px;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 3;
+}
+
+.grid th:hover .grid__filterBtn { opacity: 1; }
+
+.grid__filterIcon {
+  font-size: 8px;
+  color: #2563EB;
+  margin-left: 2px;
+}
+
+.filterDropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 200;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+  min-width: 160px;
+  max-height: 260px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.filterDropdown__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.filterDropdown__list {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.filterDropdown__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--text-primary);
+}
+
+.filterDropdown__item:hover {
+  background: var(--bg-hover);
+}
+
+.filterDropdown__item input[type="checkbox"] {
+  width: 12px;
+  height: 12px;
+  cursor: pointer;
+}
+
+/* ── Data tool toast ────────────────────────────────────────── */
+.dataToolToast {
+  position: fixed;
+  bottom: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2000;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.14);
+  padding: 8px 20px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+  cursor: pointer;
+  animation: toastIn 0.2s ease-out;
+}
+
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* ── Hyperlink cell ─────────────────────────────────────────── */
+.grid__cell--link {
+  color: #2563EB !important;
+  text-decoration: underline;
+  cursor: pointer !important;
+}
+
+.grid__cell--link:hover {
+  color: #1D4ED8 !important;
+}
+
+/* ── Print styles ───────────────────────────────────────────── */
+@media print {
+  .toolbar, .analysisTabs, .sheetTabs, .formulaBar,
+  .findBar, .pendingBar, .statusBar, .ctxMenu,
+  .condFmtPanel, .commentEditor, .dataToolToast {
+    display: none !important;
+  }
+  .gridWrap {
+    overflow: visible !important;
+    height: auto !important;
+  }
+  .grid {
+    page-break-inside: auto;
+  }
+  .grid tr {
+    page-break-inside: avoid;
+  }
+  .viewer {
+    height: auto !important;
+    overflow: visible !important;
+  }
+}

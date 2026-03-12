@@ -702,12 +702,21 @@ async def get_grid(
                         display = "TRUE" if val else "FALSE"
                     else:
                         display = str(val)
-                    row_cells.append({
+                    cell_out = {
                         "v": display,
                         "f": bool(cd.formula),
                         "t": cd.data_type,
                         "nr": cd.named_range or "",
-                    })
+                    }
+                    if cd.style:
+                        sd = cd.style.to_dict()
+                        if sd:
+                            cell_out["s"] = sd
+                    if cd.is_merged:
+                        cell_out["mg"] = True
+                    if cd.merge_master:
+                        cell_out["mm"] = cd.merge_master
+                    row_cells.append(cell_out)
             rows.append(row_cells)
 
         sheets_out.append({
@@ -863,3 +872,512 @@ async def explain_cell(
         pagerank=data.get("pagerank", 0.0),
         depends_on=data.get("depends_on", []),
     )
+
+
+@router.post("/{uuid}/format-cells")
+async def format_cells(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Apply formatting to a range of cells.
+    payload: { cells: ["Sheet1!A1", ...], style: { b: true, fc: "#FF0000", ... } }
+    """
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from parser.xlsx_parser import CellStyle
+
+    cell_addrs = payload.get("cells", [])
+    style_patch = payload.get("style", {})
+    workbook_data = data_cache[uuid]
+
+    from parser.xlsx_parser import CellData, _infer_data_type
+    from openpyxl.utils import column_index_from_string
+
+    updated = 0
+    for addr in cell_addrs:
+        cd = workbook_data.cells.get(addr)
+        if not cd:
+            # Create a placeholder CellData for cells not yet in cache
+            try:
+                parts = addr.split("!")
+                if len(parts) != 2:
+                    continue
+                sheet_name, cell_ref = parts[0], parts[1]
+                import re
+                m = re.match(r"([A-Za-z]+)(\d+)", cell_ref)
+                if not m:
+                    continue
+                col_idx = column_index_from_string(m.group(1))
+                row_idx = int(m.group(2))
+                cd = CellData(
+                    cell_address=addr,
+                    sheet_name=sheet_name,
+                    value=None,
+                    formula=None,
+                    data_type="empty",
+                    named_range=None,
+                    row=row_idx,
+                    col=col_idx,
+                    is_hardcoded=False,
+                    is_merged=False,
+                    merge_master=None,
+                )
+                workbook_data.cells[addr] = cd
+            except Exception:
+                continue
+        if cd.style is None:
+            cd.style = CellStyle()
+        s = cd.style
+        if "b" in style_patch: s.bold = bool(style_patch["b"])
+        if "i" in style_patch: s.italic = bool(style_patch["i"])
+        if "u" in style_patch: s.underline = bool(style_patch["u"])
+        if "fs" in style_patch: s.font_size = float(style_patch["fs"])
+        if "fn" in style_patch: s.font_name = str(style_patch["fn"])
+        if "fc" in style_patch: s.font_color = str(style_patch["fc"])
+        if "bg" in style_patch: s.bg_color = str(style_patch["bg"])
+        if "ha" in style_patch: s.h_align = str(style_patch["ha"])
+        if "va" in style_patch: s.v_align = str(style_patch["va"])
+        if "wt" in style_patch: s.wrap_text = bool(style_patch["wt"])
+        if "ind" in style_patch: s.indent = int(style_patch["ind"])
+        if "nf" in style_patch: s.number_format = str(style_patch["nf"])
+        if "bt" in style_patch: s.border_top = str(style_patch["bt"])
+        if "bb" in style_patch: s.border_bottom = str(style_patch["bb"])
+        if "bl" in style_patch: s.border_left = str(style_patch["bl"])
+        if "br" in style_patch: s.border_right = str(style_patch["br"])
+        if "bc" in style_patch: s.border_color = str(style_patch["bc"])
+        updated += 1
+
+    return {"updated": updated}
+
+
+@router.post("/{uuid}/insert-row")
+async def insert_row(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Insert a row at given position. payload: { sheet, row (1-based), count? }"""
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from openpyxl.utils import get_column_letter as gcl
+    from parser.xlsx_parser import CellData, _infer_data_type
+
+    sheet = payload.get("sheet", "")
+    row_num = int(payload.get("row", 1))
+    count = int(payload.get("count", 1))
+    workbook_data = data_cache[uuid]
+
+    cells_to_shift = sorted(
+        [c for c in workbook_data.cells.values() if c.sheet_name == sheet and c.row >= row_num],
+        key=lambda c: (-c.row, c.col),
+    )
+
+    for cd in cells_to_shift:
+        old_addr = cd.cell_address
+        del workbook_data.cells[old_addr]
+        cd.row += count
+        col_letter = gcl(cd.col)
+        cd.cell_address = f"{sheet}!{col_letter}{cd.row}"
+        workbook_data.cells[cd.cell_address] = cd
+
+    return {"inserted": count, "at_row": row_num}
+
+
+@router.post("/{uuid}/insert-col")
+async def insert_col(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Insert column at position. payload: { sheet, col (1-based), count? }"""
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from openpyxl.utils import get_column_letter as gcl
+    from parser.xlsx_parser import CellData, _infer_data_type
+
+    sheet = payload.get("sheet", "")
+    col_num = int(payload.get("col", 1))
+    count = int(payload.get("count", 1))
+    workbook_data = data_cache[uuid]
+
+    cells_to_shift = sorted(
+        [c for c in workbook_data.cells.values() if c.sheet_name == sheet and c.col >= col_num],
+        key=lambda c: (c.row, -c.col),
+    )
+
+    for cd in cells_to_shift:
+        old_addr = cd.cell_address
+        del workbook_data.cells[old_addr]
+        cd.col += count
+        col_letter = gcl(cd.col)
+        cd.cell_address = f"{sheet}!{col_letter}{cd.row}"
+        workbook_data.cells[cd.cell_address] = cd
+
+    return {"inserted": count, "at_col": col_num}
+
+
+@router.post("/{uuid}/delete-row")
+async def delete_row(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Delete row(s). payload: { sheet, row (1-based), count? }"""
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from openpyxl.utils import get_column_letter as gcl
+
+    sheet = payload.get("sheet", "")
+    row_num = int(payload.get("row", 1))
+    count = int(payload.get("count", 1))
+    workbook_data = data_cache[uuid]
+
+    to_remove = [
+        addr for addr, c in workbook_data.cells.items()
+        if c.sheet_name == sheet and row_num <= c.row < row_num + count
+    ]
+    for addr in to_remove:
+        del workbook_data.cells[addr]
+
+    cells_to_shift = sorted(
+        [c for c in workbook_data.cells.values() if c.sheet_name == sheet and c.row >= row_num + count],
+        key=lambda c: (c.row, c.col),
+    )
+
+    for cd in cells_to_shift:
+        old_addr = cd.cell_address
+        del workbook_data.cells[old_addr]
+        cd.row -= count
+        col_letter = gcl(cd.col)
+        cd.cell_address = f"{sheet}!{col_letter}{cd.row}"
+        workbook_data.cells[cd.cell_address] = cd
+
+    return {"deleted": count, "at_row": row_num}
+
+
+@router.post("/{uuid}/delete-col")
+async def delete_col(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Delete column(s). payload: { sheet, col (1-based), count? }"""
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from openpyxl.utils import get_column_letter as gcl
+
+    sheet = payload.get("sheet", "")
+    col_num = int(payload.get("col", 1))
+    count = int(payload.get("count", 1))
+    workbook_data = data_cache[uuid]
+
+    to_remove = [
+        addr for addr, c in workbook_data.cells.items()
+        if c.sheet_name == sheet and col_num <= c.col < col_num + count
+    ]
+    for addr in to_remove:
+        del workbook_data.cells[addr]
+
+    cells_to_shift = sorted(
+        [c for c in workbook_data.cells.values() if c.sheet_name == sheet and c.col >= col_num + count],
+        key=lambda c: (c.row, c.col),
+    )
+
+    for cd in cells_to_shift:
+        old_addr = cd.cell_address
+        del workbook_data.cells[old_addr]
+        cd.col -= count
+        col_letter = gcl(cd.col)
+        cd.cell_address = f"{sheet}!{col_letter}{cd.row}"
+        workbook_data.cells[cd.cell_address] = cd
+
+    return {"deleted": count, "at_col": col_num}
+
+
+@router.post("/{uuid}/data-validation")
+async def set_data_validation(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Set data validation on a cell range.
+    payload: { cells: ["Sheet1!A1",...], type: "list"|"number"|"text_length",
+               values?: ["a","b"], min?: 0, max?: 100, message?: "...", error_message?: "..." }
+    """
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    cells = payload.get("cells", [])
+    rule = {
+        "type": payload.get("type", "list"),
+        "values": payload.get("values", []),
+        "min": payload.get("min"),
+        "max": payload.get("max"),
+        "message": payload.get("message", ""),
+        "error_message": payload.get("error_message", "Invalid input"),
+    }
+
+    workbook_data = data_cache[uuid]
+    if not hasattr(workbook_data, "validations"):
+        workbook_data.validations = {}
+
+    for addr in cells:
+        workbook_data.validations[addr] = rule
+
+    return {"updated": len(cells), "rule": rule}
+
+
+@router.get("/{uuid}/data-validation")
+async def get_data_validation(
+    uuid: str,
+    data_cache=Depends(get_workbook_data_cache),
+):
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+    workbook_data = data_cache[uuid]
+    validations = getattr(workbook_data, "validations", {})
+    return {"validations": validations}
+
+
+@router.post("/{uuid}/named-ranges")
+async def set_named_range(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Define a named range. payload: { name: "MyRange", range: "Sheet1!A1:B10" }"""
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    name = payload.get("name", "").strip()
+    range_str = payload.get("range", "").strip()
+    if not name or not range_str:
+        raise HTTPException(status_code=400, detail="name and range are required.")
+
+    workbook_data = data_cache[uuid]
+    workbook_data.named_ranges[name] = range_str
+
+    return {"name": name, "range": range_str, "total": len(workbook_data.named_ranges)}
+
+
+@router.delete("/{uuid}/named-ranges/{name}")
+async def delete_named_range(
+    uuid: str,
+    name: str,
+    data_cache=Depends(get_workbook_data_cache),
+):
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+    workbook_data = data_cache[uuid]
+    if name in workbook_data.named_ranges:
+        del workbook_data.named_ranges[name]
+    return {"deleted": name, "total": len(workbook_data.named_ranges)}
+
+
+@router.get("/{uuid}/named-ranges")
+async def get_named_ranges(
+    uuid: str,
+    data_cache=Depends(get_workbook_data_cache),
+):
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+    return {"named_ranges": data_cache[uuid].named_ranges}
+
+
+@router.post("/{uuid}/goal-seek")
+async def goal_seek(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Goal Seek: find input value that makes target cell equal goal.
+    payload: { target_cell: "Sheet1!B10", goal: 1000, changing_cell: "Sheet1!A1" }
+    Uses simple bisection method.
+    """
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from parser.xlsx_parser import _infer_data_type
+
+    target_addr = payload.get("target_cell", "")
+    goal = float(payload.get("goal", 0))
+    changing_addr = payload.get("changing_cell", "")
+    workbook_data = data_cache[uuid]
+
+    if target_addr not in workbook_data.cells or changing_addr not in workbook_data.cells:
+        raise HTTPException(status_code=404, detail="Cell not found.")
+
+    changing_cell = workbook_data.cells[changing_addr]
+    original_value = changing_cell.value
+
+    def get_target_value(input_val):
+        changing_cell.value = input_val
+        target = workbook_data.cells.get(target_addr)
+        if target and target.value is not None:
+            try:
+                return float(target.value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    lo, hi = -1e6, 1e6
+    result = original_value
+    best_diff = float("inf")
+
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        val = get_target_value(mid)
+        if val is None:
+            break
+        diff = abs(val - goal)
+        if diff < best_diff:
+            best_diff = diff
+            result = mid
+        if diff < 0.0001:
+            break
+        if val < goal:
+            lo = mid
+        else:
+            hi = mid
+
+    changing_cell.value = result
+    changing_cell.data_type = _infer_data_type(result, None)
+
+    return {
+        "changing_cell": changing_addr,
+        "result_value": result,
+        "target_cell": target_addr,
+        "achieved_value": get_target_value(result),
+        "goal": goal,
+        "difference": best_diff,
+    }
+
+
+@router.post("/{uuid}/text-to-columns")
+async def text_to_columns(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Split a column's text by delimiter into multiple columns.
+    payload: { sheet, col (1-based), delimiter: "," | ";" | " " | "\\t" }
+    """
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from openpyxl.utils import get_column_letter as gcl
+    from parser.xlsx_parser import CellData, CellStyle, _infer_data_type
+
+    sheet = payload.get("sheet", "")
+    col_num = int(payload.get("col", 1))
+    delimiter = payload.get("delimiter", ",")
+    workbook_data = data_cache[uuid]
+
+    cells_in_col = sorted(
+        [c for c in workbook_data.cells.values()
+         if c.sheet_name == sheet and c.col == col_num],
+        key=lambda c: c.row,
+    )
+
+    max_parts = 0
+    split_data = []
+    for cd in cells_in_col:
+        val = str(cd.value) if cd.value is not None else ""
+        parts = val.split(delimiter)
+        parts = [p.strip() for p in parts]
+        max_parts = max(max_parts, len(parts))
+        split_data.append((cd.row, parts))
+
+    created = 0
+    for row_num, parts in split_data:
+        for i, part in enumerate(parts):
+            target_col = col_num + i
+            col_letter = gcl(target_col)
+            addr = f"{sheet}!{col_letter}{row_num}"
+            parsed = part
+            try:
+                parsed = int(part)
+            except ValueError:
+                try:
+                    parsed = float(part)
+                except ValueError:
+                    pass
+
+            if addr in workbook_data.cells:
+                workbook_data.cells[addr].value = parsed
+                workbook_data.cells[addr].data_type = _infer_data_type(parsed, None)
+            else:
+                workbook_data.cells[addr] = CellData(
+                    cell_address=addr, sheet_name=sheet, value=parsed,
+                    formula=None, data_type=_infer_data_type(parsed, None),
+                    named_range=None, row=row_num, col=target_col,
+                    is_hardcoded=isinstance(parsed, (int, float)),
+                    is_merged=False, merge_master=None,
+                )
+            created += 1
+
+    return {"split_into_columns": max_parts, "cells_written": created}
+
+
+@router.post("/{uuid}/remove-duplicates")
+async def remove_duplicates(
+    uuid: str,
+    payload: dict = Body(...),
+    data_cache=Depends(get_workbook_data_cache),
+):
+    """Remove duplicate rows based on specified columns.
+    payload: { sheet, columns: [1, 2] (1-based col indices, empty = all), keep_first: true }
+    """
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    from openpyxl.utils import get_column_letter as gcl
+
+    sheet = payload.get("sheet", "")
+    columns = payload.get("columns", [])
+    keep_first = payload.get("keep_first", True)
+    workbook_data = data_cache[uuid]
+
+    sheet_cells = [c for c in workbook_data.cells.values() if c.sheet_name == sheet]
+    if not sheet_cells:
+        return {"removed": 0}
+
+    max_row = max(c.row for c in sheet_cells)
+    max_col = max(c.col for c in sheet_cells)
+
+    cell_lookup = {}
+    for c in sheet_cells:
+        cell_lookup[(c.row, c.col)] = c
+
+    check_cols = columns if columns else list(range(1, max_col + 1))
+    seen = set()
+    rows_to_remove = []
+
+    for r in range(2, max_row + 1):
+        key_parts = []
+        for col in check_cols:
+            cd = cell_lookup.get((r, col))
+            key_parts.append(str(cd.value) if cd and cd.value is not None else "")
+        key = tuple(key_parts)
+        if key in seen:
+            rows_to_remove.append(r)
+        else:
+            seen.add(key)
+
+    removed = 0
+    for r in rows_to_remove:
+        addrs_to_del = [
+            addr for addr, c in workbook_data.cells.items()
+            if c.sheet_name == sheet and c.row == r
+        ]
+        for addr in addrs_to_del:
+            del workbook_data.cells[addr]
+        removed += 1
+
+    return {"removed": removed, "remaining_rows": max_row - removed}

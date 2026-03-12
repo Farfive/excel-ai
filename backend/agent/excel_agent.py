@@ -132,6 +132,14 @@ Plan: [{"step": 1, "tool": "write_range", "args": {"sheet": "Assumptions", "rang
 """
 
 
+KPI_KEYWORDS = [
+    'revenue', 'net income', 'ebit', 'ebitda', 'gross profit', 'gross margin',
+    'net margin', 'ebit margin', 'operating income', 'free cash flow', 'fcf',
+    'enterprise value', 'equity value', 'price per share', 'eps', 'npv', 'irr',
+    'total assets', 'total liabilities', 'cash', 'wacc', 'terminal value',
+]
+
+
 class ExcelAgent:
     def __init__(
         self,
@@ -147,7 +155,103 @@ class ExcelAgent:
         self.workbook_data = workbook_data or tools.workbook_data
         self.scenario_manager = scenario_manager
 
-    def build_cell_index(self, max_rows_per_sheet: int = 50) -> str:
+    def _compute_impact(self, plan: List[Dict]) -> Dict:
+        """Traverse dependency graph from write_range targets to estimate impact on KPIs.
+        Returns dict with: cells_affected (int), kpis (list of {label, cell, current_value, note}).
+        """
+        graph = self.tools.graph
+        wb = self.workbook_data
+
+        # 1. Collect all cells being written
+        written_cells = set()
+        written_values: Dict[str, Any] = {}
+        for step in plan:
+            if step.get("tool") not in ("write_range", "write_formula"):
+                continue
+            args = step.get("args", {})
+            sheet = args.get("sheet", "")
+            rng = args.get("range") or args.get("cell", "")
+            if sheet and rng:
+                addr = f"{sheet}!{rng.upper()}"
+                written_cells.add(addr)
+                vals = args.get("values")
+                if isinstance(vals, list) and vals:
+                    written_values[addr] = vals[0]
+                elif isinstance(vals, dict):
+                    written_values.update(vals)
+                elif args.get("formula"):
+                    written_values[addr] = f"={args['formula']}"
+
+        if not written_cells:
+            return {"cells_affected": 0, "kpis": [], "written": []}
+
+        # 2. BFS forward through dependency graph to find all downstream cells
+        affected: set = set()
+        queue = list(written_cells)
+        visited = set(written_cells)
+        while queue:
+            node = queue.pop(0)
+            for successor in graph.successors(node) if graph.has_node(node) else []:
+                if successor not in visited:
+                    visited.add(successor)
+                    affected.add(successor)
+                    queue.append(successor)
+
+        # 3. Among affected cells, find KPI-labelled ones (check row-label in col A)
+        kpis = []
+        seen_labels = set()
+        for addr in sorted(affected):
+            cd = wb.cells.get(addr)
+            if not cd or cd.value is None:
+                continue
+            # Try to find row label (col A of same row)
+            label_addr = f"{cd.sheet_name}!A{cd.row}"
+            label_cd = wb.cells.get(label_addr)
+            label = str(label_cd.value).strip() if label_cd and label_cd.value else ""
+            label_lower = label.lower()
+
+            is_kpi = any(kw in label_lower for kw in KPI_KEYWORDS)
+            if not is_kpi or label_lower in seen_labels:
+                continue
+            seen_labels.add(label_lower)
+
+            current_val = cd.value
+            formatted = None
+            if isinstance(current_val, float):
+                if abs(current_val) < 1:
+                    formatted = f"{current_val:.1%}"
+                elif abs(current_val) > 1_000_000:
+                    formatted = f"${current_val/1_000_000:.1f}M"
+                elif abs(current_val) > 1_000:
+                    formatted = f"${current_val:,.0f}"
+                else:
+                    formatted = f"{current_val:.2f}"
+            elif isinstance(current_val, int):
+                formatted = f"{current_val:,}" if abs(current_val) > 999 else str(current_val)
+            else:
+                formatted = str(current_val)[:20]
+
+            kpis.append({
+                "label": label,
+                "cell": addr,
+                "current_value": formatted,
+                "sheet": cd.sheet_name,
+            })
+            if len(kpis) >= 8:
+                break
+
+        # 4. Summarise written cells for display
+        written_summary = []
+        for addr, val in written_values.items():
+            written_summary.append({"cell": addr, "new_value": str(val)[:30]})
+
+        return {
+            "cells_affected": len(affected),
+            "kpis": kpis,
+            "written": written_summary,
+        }
+
+    def build_cell_index(self, max_rows_per_sheet: int = 25) -> str:
         """Build a SheetCompressor-style cell index with 3-layer context.
 
         Layer 1 — Local: cell labels + adjacent values per row
@@ -274,7 +378,7 @@ class ExcelAgent:
             lines.append(f"\nXREF: {' | '.join(cross_sheet_refs[:20])}")
 
         result = "\n".join(lines)
-        max_chars = 6000
+        max_chars = 2500
         if len(result) > max_chars:
             result = result[:max_chars] + "\n...(truncated)"
         return result
@@ -626,7 +730,7 @@ class ExcelAgent:
         approved_plan: Optional[List[Dict]] = None,
         mode: str = "plan",
     ) -> AsyncGenerator[Dict, None]:
-        """Execute a query. mode='agent' auto-executes, mode='plan' stops for approval."""
+        """Execute a query. mode='agent' auto-executes, mode='plan' stops for approval, mode='ask' read-only Q&A."""
         yield {"event": "retrieving", "data": {"message": "Retrieving relevant context..."}}
 
         try:
@@ -639,12 +743,38 @@ class ExcelAgent:
 
         cell_index = self.build_cell_index()
 
+        # --- Ask mode: read-only Q&A, no planning, no tool execution ---
+        if mode == "ask":
+            yield {"event": "answer_start", "data": {}}
+            ask_system = (
+                "You are a read-only Excel AI assistant. You answer questions about the workbook "
+                "but you NEVER modify any cells or data. Respond in the same language as the user. "
+                "Be concise and precise. Use the provided context and cell index."
+            )
+            ask_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Workbook context:\n{context}\n\n"
+                        f"Cell index:\n{cell_index}\n\n"
+                        f"Question: {query}"
+                    ),
+                }
+            ]
+            accumulated = ""
+            async for chunk in self.ollama.stream_chat(messages=ask_messages, system=ask_system):
+                accumulated += chunk
+                yield {"event": "answer", "data": {"chunk": chunk}}
+            yield {"event": "done", "data": {"message": "Complete", "full_answer": accumulated}}
+            return
+
         if approved_plan is None:
             yield {"event": "planning", "data": {"message": "Generating execution plan..."}}
             plan = await self.plan(query, context, cell_index)
 
             if mode == "plan":
-                yield {"event": "plan_ready", "data": {"plan": plan, "requiresApproval": True}}
+                impact = self._compute_impact(plan)
+                yield {"event": "plan_ready", "data": {"plan": plan, "requiresApproval": True, "impact_preview": impact}}
                 return
             # Agent mode: auto-execute, no approval needed
         else:
@@ -718,22 +848,19 @@ class ExcelAgent:
 
         yield {"event": "answer_start", "data": {}}
 
-        results_summary = json.dumps(execution_results, default=str)[:2000]
+        results_summary = json.dumps(execution_results, default=str)[:800]
         answer_system = (
-            SYSTEM_PROMPT + "\n" + cell_index
-            + "\n\nYou just executed a plan. Summarize the results concisely. "
-            "Respond in the same language as the user."
+            "You are an Excel AI assistant. Summarize tool execution results concisely. "
+            "Respond in the same language as the user's question."
         )
         answer_messages = [
             {
                 "role": "user",
                 "content": (
-                    f"User request: {query}\n\n"
-                    f"Executed plan: {json.dumps(plan, default=str)}\n\n"
+                    f"Request: {query}\n\n"
                     f"Results: {results_summary}\n\n"
-                    "Provide a clear, concise summary of what was done. "
-                    "If values were written, confirm the exact cells and new values. "
-                    "If data was read, present it clearly."
+                    "Summarize what was done. If data was read, present it clearly. "
+                    "If cells were written, confirm the values."
                 ),
             }
         ]

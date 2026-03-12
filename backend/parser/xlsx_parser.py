@@ -9,6 +9,87 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class CellStyle:
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+    font_size: float = 11.0
+    font_name: str = "Calibri"
+    font_color: str = "#000000"
+    bg_color: str = ""
+    h_align: str = ""
+    v_align: str = ""
+    wrap_text: bool = False
+    indent: int = 0
+    number_format: str = "General"
+    border_top: str = ""
+    border_bottom: str = ""
+    border_left: str = ""
+    border_right: str = ""
+    border_color: str = "#000000"
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {}
+        if self.bold: d["b"] = True
+        if self.italic: d["i"] = True
+        if self.underline: d["u"] = True
+        d["fs"] = self.font_size
+        d["fn"] = self.font_name
+        if self.font_color != "#000000": d["fc"] = self.font_color
+        if self.bg_color: d["bg"] = self.bg_color
+        if self.h_align: d["ha"] = self.h_align
+        if self.v_align: d["va"] = self.v_align
+        if self.wrap_text: d["wt"] = True
+        if self.indent: d["ind"] = self.indent
+        if self.number_format != "General": d["nf"] = self.number_format
+        if self.border_top: d["bt"] = self.border_top
+        if self.border_bottom: d["bb"] = self.border_bottom
+        if self.border_left: d["bl"] = self.border_left
+        if self.border_right: d["br"] = self.border_right
+        if self.border_color != "#000000": d["bc"] = self.border_color
+        return d
+
+
+def _extract_style(cell) -> CellStyle:
+    s = CellStyle()
+    try:
+        font = cell.font
+        if font:
+            s.bold = bool(font.bold)
+            s.italic = bool(font.italic)
+            s.underline = font.underline not in (None, "none", False)
+            if font.size: s.font_size = float(font.size)
+            if font.name: s.font_name = font.name
+            if font.color and font.color.rgb and isinstance(font.color.rgb, str) and len(font.color.rgb) >= 6:
+                rgb = font.color.rgb
+                if len(rgb) == 8: rgb = rgb[2:]
+                s.font_color = f"#{rgb}"
+        fill = cell.fill
+        if fill and fill.fgColor and fill.fgColor.rgb and isinstance(fill.fgColor.rgb, str):
+            rgb = fill.fgColor.rgb
+            if rgb != "00000000" and len(rgb) >= 6:
+                if len(rgb) == 8: rgb = rgb[2:]
+                s.bg_color = f"#{rgb}"
+        align = cell.alignment
+        if align:
+            if align.horizontal: s.h_align = align.horizontal
+            if align.vertical: s.v_align = align.vertical
+            if align.wrap_text: s.wrap_text = True
+            if align.indent: s.indent = int(align.indent)
+        if cell.number_format and cell.number_format != "General":
+            s.number_format = cell.number_format
+        border = cell.border
+        if border:
+            if border.top and border.top.style: s.border_top = border.top.style
+            if border.bottom and border.bottom.style: s.border_bottom = border.bottom.style
+            if border.left and border.left.style: s.border_left = border.left.style
+            if border.right and border.right.style: s.border_right = border.right.style
+    except Exception:
+        pass
+    return s
+
+
+@dataclass
 class CellData:
     cell_address: str
     sheet_name: str
@@ -22,6 +103,7 @@ class CellData:
     is_merged: bool
     merge_master: Optional[str]
     is_hidden: bool = False
+    style: Optional[CellStyle] = None
 
 
 @dataclass
@@ -116,6 +198,7 @@ class XLSXParser:
                             is_merged=True,
                             merge_master=merged_cells_map[cell_address],
                             is_hidden=is_hidden,
+                            style=_extract_style(cell),
                         )
                         workbook_data.cells[cell_address] = cell_data
                         continue
@@ -159,6 +242,7 @@ class XLSXParser:
                         is_merged=is_merged_master,
                         merge_master=None,
                         is_hidden=is_hidden,
+                        style=_extract_style(cell),
                     )
                     workbook_data.cells[cell_address] = cell_data
 
