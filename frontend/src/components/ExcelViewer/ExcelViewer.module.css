@@ -492,6 +492,140 @@ thead .grid__rowNum {
 .legend__dot--anomaly { background: var(--accent-dim); border: 1px solid var(--accent); }
 .legend__dot--changed { background: var(--green-dim); border: 1px solid var(--green); }
 
+/* ── Context menu ────────────────────────────────────────────── */
+.ctxMenu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+  padding: 4px 0;
+  min-width: 180px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+
+.ctxMenu__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 6px 14px;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+
+.ctxMenu__item:hover {
+  background: var(--bg-hover);
+}
+
+.ctxMenu__shortcut {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-left: 20px;
+}
+
+.ctxMenu__sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+/* ── Find & Replace bar ─────────────────────────────────────── */
+.findBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.findBar__input {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text-primary);
+  width: 160px;
+  outline: none;
+}
+
+.findBar__input:focus {
+  border-color: #2563EB;
+}
+
+.findBar__count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  min-width: 70px;
+  text-align: center;
+}
+
+.findBar__btn {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 3px 8px;
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.findBar__btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ── Find match highlight ────────────────────────────────────── */
+.grid__cell--findMatch {
+  background: rgba(250, 204, 21, 0.25) !important;
+  outline: 1px solid var(--yellow) !important;
+}
+
+/* ── Sort icon ───────────────────────────────────────────────── */
+.grid__sortIcon {
+  font-size: 8px;
+  color: var(--accent);
+  margin-left: 2px;
+}
+
+.grid th.grid__colHeader--sorted {
+  background: var(--bg-hover);
+}
+
+/* ── Column resize handle ────────────────────────────────────── */
+.grid th {
+  position: relative;
+}
+
+.grid__resizeHandle {
+  position: absolute;
+  top: 0;
+  right: -2px;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 5;
+}
+
+.grid__resizeHandle:hover {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
 /* ── Analysis panel inside viewer ───────────────────────────── */
 .analysisTabs {
   display: flex;

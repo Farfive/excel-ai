@@ -69,6 +69,32 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
   const [editValue, setEditValue] = useState('');
   const [saving, setSaving] = useState(false);
 
+  // ── Context menu state ──
+  const [ctxMenu, setCtxMenu] = useState<{x: number; y: number; row: number; col: number} | null>(null);
+
+  // ── Clipboard state ──
+  const [clipboard, setClipboard] = useState<{value: string; isFormula: boolean; isCut: boolean} | null>(null);
+
+  // ── Undo/Redo state ──
+  const undoStack = useRef<Array<{cell: string; sheet: string; oldVal: string; newVal: string}>>([]); 
+  const redoStack = useRef<Array<{cell: string; sheet: string; oldVal: string; newVal: string}>>([]); 
+
+  // ── Find & Replace state ──
+  const [showFind, setShowFind] = useState(false);
+  const [findText, setFindText] = useState('');
+  const [replaceText, setReplaceText] = useState('');
+  const [findMatches, setFindMatches] = useState<Array<{row: number; col: number}>>([]); 
+  const [findIdx, setFindIdx] = useState(-1);
+  const findInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Column widths state (for resize) ──
+  const [colWidths, setColWidths] = useState<Record<number, number>>({});
+  const resizingCol = useRef<{col: number; startX: number; startW: number} | null>(null);
+
+  // ── Sort state ──
+  const [sortCol, setSortCol] = useState<number | null>(null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+
   const currentSheet = sheets[activeSheet] || null;
 
   const pendingMap = useRef<Map<string, CellChange>>(new Map());
@@ -181,6 +207,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
     } else {
       setSaving(true);
       try {
+        pushUndo(addr, currentSheet.name, oldVal, newVal);
         await editCell(workbookInfo.workbook_uuid, currentSheet.name, addr, newVal);
         fetchGrid(workbookInfo.workbook_uuid);
       } catch (e) {
@@ -205,6 +232,169 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
     }
     setTimeout(() => gridWrapRef.current?.focus(), 0);
   }, [editingCell, editValue, workbookInfo, sheets, activeSheet, saving, getCellAddr, getRawCell]);
+
+  // ── Undo / Redo helpers ──
+  const pushUndo = useCallback((cell: string, sheet: string, oldVal: string, newVal: string) => {
+    undoStack.current.push({ cell, sheet, oldVal, newVal });
+    redoStack.current = [];
+  }, []);
+
+  const handleUndo = useCallback(async () => {
+    const entry = undoStack.current.pop();
+    if (!entry || !workbookInfo) return;
+    redoStack.current.push(entry);
+    await editCell(workbookInfo.workbook_uuid, entry.sheet, entry.cell, entry.oldVal);
+    fetchGrid(workbookInfo.workbook_uuid);
+  }, [workbookInfo]);
+
+  const handleRedo = useCallback(async () => {
+    const entry = redoStack.current.pop();
+    if (!entry || !workbookInfo) return;
+    undoStack.current.push(entry);
+    await editCell(workbookInfo.workbook_uuid, entry.sheet, entry.cell, entry.newVal);
+    fetchGrid(workbookInfo.workbook_uuid);
+  }, [workbookInfo]);
+
+  // ── Clipboard helpers ──
+  const handleCopy = useCallback((cut = false) => {
+    if (!selectedCell || !currentSheet) return;
+    const raw = getRawCell(selectedCell.row, selectedCell.col);
+    if (!raw) return;
+    const val = raw.f ? `=${raw.v}` : raw.v;
+    setClipboard({ value: val, isFormula: raw.f, isCut: cut });
+    try { navigator.clipboard.writeText(raw.v); } catch {}
+  }, [selectedCell, currentSheet, getRawCell]);
+
+  const handlePaste = useCallback(async () => {
+    if (!selectedCell || !workbookInfo || !currentSheet) return;
+    let val = clipboard?.value ?? '';
+    if (!val) {
+      try { val = await navigator.clipboard.readText(); } catch { return; }
+    }
+    const addr = getCellAddr(selectedCell.row, selectedCell.col);
+    const oldCell = getRawCell(selectedCell.row, selectedCell.col);
+    pushUndo(addr, currentSheet.name, oldCell?.v ?? '', val);
+    await editCell(workbookInfo.workbook_uuid, currentSheet.name, addr, val);
+    if (clipboard?.isCut) setClipboard(null);
+    fetchGrid(workbookInfo.workbook_uuid);
+  }, [selectedCell, clipboard, workbookInfo, currentSheet, getCellAddr, getRawCell, pushUndo]);
+
+  // ── Find & Replace logic ──
+  const runFind = useCallback((text: string) => {
+    if (!currentSheet || !text) { setFindMatches([]); setFindIdx(-1); return; }
+    const matches: Array<{row: number; col: number}> = [];
+    const lower = text.toLowerCase();
+    currentSheet.rows.forEach((row, r) => {
+      row.forEach((cell, c) => {
+        if (cell.v && cell.v.toLowerCase().includes(lower)) matches.push({ row: r, col: c });
+      });
+    });
+    setFindMatches(matches);
+    setFindIdx(matches.length > 0 ? 0 : -1);
+    if (matches.length > 0) setSelectedCell(matches[0]);
+  }, [currentSheet]);
+
+  const findNext = useCallback(() => {
+    if (findMatches.length === 0) return;
+    const next = (findIdx + 1) % findMatches.length;
+    setFindIdx(next);
+    setSelectedCell(findMatches[next]);
+  }, [findMatches, findIdx]);
+
+  const findPrev = useCallback(() => {
+    if (findMatches.length === 0) return;
+    const prev = (findIdx - 1 + findMatches.length) % findMatches.length;
+    setFindIdx(prev);
+    setSelectedCell(findMatches[prev]);
+  }, [findMatches, findIdx]);
+
+  const handleReplaceOne = useCallback(async () => {
+    if (findIdx < 0 || !workbookInfo || !currentSheet) return;
+    const match = findMatches[findIdx];
+    const addr = getCellAddr(match.row, match.col);
+    const raw = getRawCell(match.row, match.col);
+    const oldV = raw?.v ?? '';
+    const newV = oldV.replace(new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), replaceText);
+    pushUndo(addr, currentSheet.name, oldV, newV);
+    await editCell(workbookInfo.workbook_uuid, currentSheet.name, addr, newV);
+    fetchGrid(workbookInfo.workbook_uuid);
+    runFind(findText);
+  }, [findIdx, findMatches, findText, replaceText, workbookInfo, currentSheet, getCellAddr, getRawCell, pushUndo, runFind]);
+
+  const handleReplaceAll = useCallback(async () => {
+    if (findMatches.length === 0 || !workbookInfo || !currentSheet) return;
+    for (const match of findMatches) {
+      const addr = getCellAddr(match.row, match.col);
+      const raw = getRawCell(match.row, match.col);
+      const oldV = raw?.v ?? '';
+      const newV = oldV.replace(new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), replaceText);
+      await editCell(workbookInfo.workbook_uuid, currentSheet.name, addr, newV);
+    }
+    fetchGrid(workbookInfo.workbook_uuid);
+    setFindMatches([]);
+    setFindIdx(-1);
+  }, [findMatches, findText, replaceText, workbookInfo, currentSheet, getCellAddr, getRawCell]);
+
+  // ── Column sort ──
+  const handleSort = useCallback((colIdx: number, dir: 'asc' | 'desc') => {
+    setSortCol(colIdx);
+    setSortDir(dir);
+    setCtxMenu(null);
+  }, []);
+
+  const sortedRows = (() => {
+    if (!currentSheet) return [];
+    if (sortCol === null) return currentSheet.rows;
+    const rows = [...currentSheet.rows];
+    const headerRow = rows.shift();
+    rows.sort((a, b) => {
+      const va = a[sortCol]?.v ?? '';
+      const vb = b[sortCol]?.v ?? '';
+      const na = parseFloat(va.replace(/[,$%]/g, ''));
+      const nb = parseFloat(vb.replace(/[,$%]/g, ''));
+      if (!isNaN(na) && !isNaN(nb)) return sortDir === 'asc' ? na - nb : nb - na;
+      return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+    if (headerRow) rows.unshift(headerRow);
+    return rows;
+  })();
+
+  // ── Context menu handler ──
+  const handleContextMenu = useCallback((e: React.MouseEvent, row: number, col: number) => {
+    e.preventDefault();
+    setSelectedCell({ row, col });
+    setCtxMenu({ x: e.clientX, y: e.clientY, row, col });
+  }, []);
+
+  // Close context menu on click anywhere
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    window.addEventListener('click', close);
+    return () => window.removeEventListener('click', close);
+  }, [ctxMenu]);
+
+  // ── Column resize handlers ──
+  const handleResizeStart = useCallback((e: React.MouseEvent, colIdx: number) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startW = colWidths[colIdx] || 90;
+    resizingCol.current = { col: colIdx, startX: e.clientX, startW };
+
+    const onMove = (ev: MouseEvent) => {
+      if (!resizingCol.current) return;
+      const delta = ev.clientX - resizingCol.current.startX;
+      const newW = Math.max(40, resizingCol.current.startW + delta);
+      setColWidths(prev => ({ ...prev, [resizingCol.current!.col]: newW }));
+    };
+    const onUp = () => {
+      resizingCol.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [colWidths]);
 
   // ── Keyboard handler for grid ──
   const handleGridKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -232,6 +422,15 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
       if (e.key === 'F2')         { e.preventDefault(); startEditing(row, col); return; }
       if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); startEditing(row, col, ''); return; }
       if (e.key === 'Escape')     { e.preventDefault(); setSelectedCell(null); return; }
+      // Cmd/Ctrl shortcuts
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key === 'c') { e.preventDefault(); handleCopy(false); return; }
+      if (mod && e.key === 'x') { e.preventDefault(); handleCopy(true); return; }
+      if (mod && e.key === 'v') { e.preventDefault(); handlePaste(); return; }
+      if (mod && e.key === 'z' && !e.shiftKey) { e.preventDefault(); handleUndo(); return; }
+      if (mod && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); handleRedo(); return; }
+      if (mod && e.key === 'f') { e.preventDefault(); setShowFind(true); setTimeout(() => findInputRef.current?.focus(), 0); return; }
+
       // Printable character → start editing with that char
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
         e.preventDefault();
@@ -239,7 +438,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
         return;
       }
     }
-  }, [selectedCell, editingCell, editValue, currentSheet, startEditing, cancelEditing, commitEdit]);
+  }, [selectedCell, editingCell, editValue, currentSheet, startEditing, cancelEditing, commitEdit, handleCopy, handlePaste, handleUndo, handleRedo]);
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -569,6 +768,40 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
             </div>
           )}
 
+          {/* Find & Replace bar */}
+          {showFind && (
+            <div className={styles.findBar}>
+              <input
+                ref={findInputRef}
+                className={styles.findBar__input}
+                placeholder="Find…"
+                value={findText}
+                onChange={e => { setFindText(e.target.value); runFind(e.target.value); }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') { e.preventDefault(); e.shiftKey ? findPrev() : findNext(); }
+                  if (e.key === 'Escape') { e.preventDefault(); setShowFind(false); setFindMatches([]); setFindIdx(-1); }
+                }}
+              />
+              <input
+                className={styles.findBar__input}
+                placeholder="Replace…"
+                value={replaceText}
+                onChange={e => setReplaceText(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Escape') { e.preventDefault(); setShowFind(false); setFindMatches([]); setFindIdx(-1); }
+                }}
+              />
+              <span className={styles.findBar__count}>
+                {findMatches.length > 0 ? `${findIdx + 1}/${findMatches.length}` : 'No matches'}
+              </span>
+              <button className={styles.findBar__btn} onClick={findPrev} type="button" title="Previous">▲</button>
+              <button className={styles.findBar__btn} onClick={findNext} type="button" title="Next">▼</button>
+              <button className={styles.findBar__btn} onClick={handleReplaceOne} type="button" title="Replace">Replace</button>
+              <button className={styles.findBar__btn} onClick={handleReplaceAll} type="button" title="Replace All">All</button>
+              <button className={styles.findBar__btn} onClick={() => { setShowFind(false); setFindMatches([]); setFindIdx(-1); }} type="button" title="Close">✕</button>
+            </div>
+          )}
+
           {/* Grid */}
           <div
             className={styles.gridWrap}
@@ -589,13 +822,22 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                     {currentSheet.colHeaders.map((h, ci) => (
                       <th
                         key={h}
-                        className={selectedCell?.col === ci ? styles['grid__colHeader--selected'] : ''}
-                      >{h}</th>
+                        className={`${selectedCell?.col === ci ? styles['grid__colHeader--selected'] : ''} ${sortCol === ci ? styles['grid__colHeader--sorted'] : ''}`}
+                        style={colWidths[ci] ? { width: colWidths[ci], minWidth: colWidths[ci], maxWidth: colWidths[ci] } : undefined}
+                        onClick={() => handleSort(ci, sortCol === ci && sortDir === 'asc' ? 'desc' : 'asc')}
+                      >
+                        {h}
+                        {sortCol === ci && <span className={styles.grid__sortIcon}>{sortDir === 'asc' ? ' ▲' : ' ▼'}</span>}
+                        <span
+                          className={styles.grid__resizeHandle}
+                          onMouseDown={e => handleResizeStart(e, ci)}
+                        />
+                      </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {currentSheet.rows.map((row, r) => (
+                  {sortedRows.map((row, r) => (
                     <tr key={r}>
                       <td className={`${styles.grid__rowNum} ${selectedCell?.row === r ? styles['grid__rowNum--selected'] : ''}`}>{r + 1}</td>
                       {row.map((cell, c) => {
@@ -610,6 +852,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                         const isHeader = r === 0 && !isFormula && !isEmpty;
                         const isSel = selectedCell?.row === r && selectedCell?.col === c;
                         const isEditing = editingCell?.row === r && editingCell?.col === c;
+                        const isFindMatch = findMatches.some(m => m.row === r && m.col === c);
                         const cls = [
                           styles.grid__cell,
                           isFormula ? styles['grid__cell--formula'] : styles['grid__cell--hardcoded'],
@@ -620,6 +863,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                           isPending ? styles['grid__cell--pending'] : '',
                           isSel && !isEditing ? styles['grid__cell--selected'] : '',
                           isEditing ? styles['grid__cell--editing'] : '',
+                          isFindMatch ? styles['grid__cell--findMatch'] : '',
                           selectedCell && !isSel && selectedCell.col === c ? styles.grid__colHighlight : '',
                           selectedCell && !isSel && selectedCell.row === r ? styles.grid__rowHighlight : '',
                         ].filter(Boolean).join(' ');
@@ -627,6 +871,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                           <td
                             key={c}
                             className={cls}
+                            style={colWidths[c] ? { width: colWidths[c], minWidth: colWidths[c], maxWidth: colWidths[c] } : undefined}
                             title={isPending ? `${formatDiffVal(pending.before)} → ${formatDiffVal(pending.after)}` : (cell.nr ? `Named: ${cell.nr}` : cell.v)}
                             onClick={() => {
                               if (isEditing) return;
@@ -634,6 +879,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                               if (editingCell) commitEdit();
                             }}
                             onDoubleClick={() => startEditing(r, c)}
+                            onContextMenu={e => handleContextMenu(e, r, c)}
                           >
                             {isEditing ? (
                               <input
@@ -646,7 +892,6 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                                   if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); }
                                 }}
                                 onBlur={() => {
-                                  // Delay to allow click events to fire first
                                   setTimeout(() => {
                                     if (editingCell?.row === r && editingCell?.col === c) commitEdit();
                                   }, 100);
@@ -672,6 +917,35 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
               </div>
             )}
           </div>
+
+          {/* Context menu */}
+          {ctxMenu && (
+            <div className={styles.ctxMenu} style={{ left: ctxMenu.x, top: ctxMenu.y }}>
+              <button className={styles.ctxMenu__item} onClick={() => { handleCopy(false); setCtxMenu(null); }} type="button">
+                Copy
+                <span className={styles.ctxMenu__shortcut}>⌘C</span>
+              </button>
+              <button className={styles.ctxMenu__item} onClick={() => { handleCopy(true); setCtxMenu(null); }} type="button">
+                Cut
+                <span className={styles.ctxMenu__shortcut}>⌘X</span>
+              </button>
+              <button className={styles.ctxMenu__item} onClick={() => { handlePaste(); setCtxMenu(null); }} type="button">
+                Paste
+                <span className={styles.ctxMenu__shortcut}>⌘V</span>
+              </button>
+              <div className={styles.ctxMenu__sep} />
+              <button className={styles.ctxMenu__item} onClick={() => { startEditing(ctxMenu.row, ctxMenu.col, ''); setCtxMenu(null); }} type="button">
+                Clear cell
+              </button>
+              <div className={styles.ctxMenu__sep} />
+              <button className={styles.ctxMenu__item} onClick={() => handleSort(ctxMenu.col, 'asc')} type="button">
+                Sort A → Z
+              </button>
+              <button className={styles.ctxMenu__item} onClick={() => handleSort(ctxMenu.col, 'desc')} type="button">
+                Sort Z → A
+              </button>
+            </div>
+          )}
 
           {/* Pending changes bar */}
           {pendingChanges.length > 0 && (
