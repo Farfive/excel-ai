@@ -298,12 +298,12 @@
 
 .diff__val--before {
   background: rgba(239, 68, 68, 0.08);
-  color: #f87171;
+  color: #DC2626;
   border-right: 1px solid var(--border);
 }
 
 .diff__val--after {
-  background: rgba(34, 197, 94, 0.08);
+  background: rgba(22, 163, 74, 0.08);
   color: var(--green);
 }
 

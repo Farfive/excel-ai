@@ -58,6 +58,14 @@ CRITICAL RULES:
 7. For DELETE operations: ALWAYS use confirmed=false first to show preview. The system will handle the confirmation flow.
 8. For formulas: use write_formula, NOT write_range. Do NOT include the leading "=" in the formula string.
 
+MULTI-SHEET AWARENESS:
+- The CELL INDEX below shows ALL sheets in the workbook, not just one.
+- The XREF section at the bottom shows cross-sheet formula dependencies (e.g. Revenue→P&L means P&L has formulas referencing Revenue).
+- When a user request affects data that flows to other sheets (via XREF), consider downstream impacts.
+- You can create multi-step plans that span multiple sheets in a single operation.
+- When reading or writing, always specify the correct sheet name for each step.
+- If a change in one sheet should propagate (e.g. changing an assumption that affects Revenue, P&L, DCF), explain the downstream impact.
+
 AVAILABLE TOOLS:
 
 Data Reading:
@@ -117,6 +125,10 @@ Plan: [{"step": 1, "tool": "pivot_table", "args": {"source_sheet": "Revenue", "t
 
 User: "Check if all formulas are consistent"
 Plan: [{"step": 1, "tool": "validate_formulas", "args": {}, "reason": "Run formula consistency validation"}]
+
+User: "Change Revenue Growth Rate to 20% and show me the impact on Net Income in P&L"
+Thinking: Revenue Growth Rate is in Assumptions!B4. Changing it will cascade through Revenue→COGS→P&L via XREF. I should write the value then read the downstream result.
+Plan: [{"step": 1, "tool": "write_range", "args": {"sheet": "Assumptions", "range": "B4", "values": [0.20]}, "reason": "Update Revenue Growth Rate to 20%"}, {"step": 2, "tool": "read_range", "args": {"sheet": "P&L", "range": "B15:K15"}, "reason": "Read Net Income row to show downstream impact of the assumption change"}]
 """
 
 
@@ -236,7 +248,7 @@ class ExcelAgent:
                     formula_cols[c.col][pattern].append(c.row)
 
                     # Layer 3: detect cross-sheet references
-                    if '!' in c.formula and len(cross_sheet_refs) < 8:
+                    if '!' in c.formula and len(cross_sheet_refs) < 20:
                         ref_match = re.search(r"([A-Za-z ]+)!", c.formula)
                         if ref_match:
                             ref_sheet = ref_match.group(1).strip("'")
@@ -259,10 +271,10 @@ class ExcelAgent:
 
         # --- Layer 3: Cross-sheet formula references ---
         if cross_sheet_refs:
-            lines.append(f"\nXREF: {' | '.join(cross_sheet_refs[:8])}")
+            lines.append(f"\nXREF: {' | '.join(cross_sheet_refs[:20])}")
 
         result = "\n".join(lines)
-        max_chars = 4000
+        max_chars = 6000
         if len(result) > max_chars:
             result = result[:max_chars] + "\n...(truncated)"
         return result

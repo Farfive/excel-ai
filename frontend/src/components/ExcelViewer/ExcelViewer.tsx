@@ -3,6 +3,7 @@ import { WorkbookInfo } from '../../types';
 import { getAnomalies, getWorkbookGrid, revertChanges, downloadWorkbook, getAuditTrail, AuditChange, diffWorkbooks } from '../../services/api';
 import { onGridRefresh, onGridDiff, CellChange } from '../../services/gridBus';
 import { AnalysisPanel } from '../Analysis/AnalysisPanel';
+import { WorkbookSummary } from '../WorkbookSummary/WorkbookSummary';
 import styles from './ExcelViewer.module.css';
 
 interface RawCell {
@@ -25,7 +26,7 @@ interface ExcelViewerProps {
   onUpload: (f: File) => void;
 }
 
-type ViewTab = 'grid' | 'analysis' | 'audit' | 'compare';
+type ViewTab = 'summary' | 'grid' | 'analysis' | 'audit' | 'compare';
 
 interface DiffCellItem { cell: string; sheet: string; type: string; old_value: unknown; new_value: unknown; delta_pct: number | null; impact: number; }
 interface DiffSheetItem { sheet: string; added: number; removed: number; modified: number; formula_changes: number; value_changes: number; max_delta_pct: number | null; }
@@ -80,6 +81,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
     prevUuid.current = workbookInfo.workbook_uuid;
     setActiveSheet(0);
     setPendingChanges([]);
+    setViewTab('summary');
 
     const uuid = workbookInfo.workbook_uuid;
 
@@ -209,6 +211,11 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
       {/* View tabs */}
       <div className={styles.analysisTabs}>
         <button
+          className={`${styles.analysisTab} ${viewTab === 'summary' ? styles['analysisTab--active'] : ''}`}
+          onClick={() => setViewTab('summary')}
+          type="button"
+        >Summary</button>
+        <button
           className={`${styles.analysisTab} ${viewTab === 'grid' ? styles['analysisTab--active'] : ''}`}
           onClick={() => setViewTab('grid')}
           type="button"
@@ -239,7 +246,17 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
         >Compare</button>
       </div>
 
-      {viewTab === 'compare' ? (
+      {viewTab === 'summary' ? (
+        <div style={{ flex: 1, overflow: 'auto' }}>
+          <WorkbookSummary
+            workbookUuid={workbookInfo!.workbook_uuid}
+            onSheetClick={(name) => {
+              const idx = sheets.findIndex(s => s.name === name);
+              if (idx >= 0) { setActiveSheet(idx); setViewTab('grid'); }
+            }}
+          />
+        </div>
+      ) : viewTab === 'compare' ? (
         <div className={styles.auditWrap} style={{ padding: 16 }}>
           <input
             ref={diffInputRef}
@@ -284,7 +301,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                 <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green)', marginBottom: 4 }}>+ Sheets added: {diffResult.sheets_added.join(', ')}</div>
               )}
               {diffResult.sheets_removed.length > 0 && (
-                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#f87171', marginBottom: 4 }}>- Sheets removed: {diffResult.sheets_removed.join(', ')}</div>
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: '#DC2626', marginBottom: 4 }}>- Sheets removed: {diffResult.sheets_removed.join(', ')}</div>
               )}
               {diffResult.sheet_diffs.length > 0 && (
                 <table className={styles.auditTable} style={{ marginBottom: 12 }}>
@@ -294,7 +311,7 @@ export function ExcelViewer({ workbookInfo, isUploading, uploadError, onUpload }
                       <tr key={sd.sheet}>
                         <td>{sd.sheet}</td>
                         <td style={{ color: 'var(--green)' }}>{sd.added || '—'}</td>
-                        <td style={{ color: '#f87171' }}>{sd.removed || '—'}</td>
+                        <td style={{ color: '#DC2626' }}>{sd.removed || '—'}</td>
                         <td>{sd.modified || '—'}</td>
                         <td>{sd.formula_changes || '—'}</td>
                         <td>{sd.value_changes || '—'}</td>

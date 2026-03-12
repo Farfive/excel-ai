@@ -223,6 +223,138 @@ async def get_audit_trail(
     }
 
 
+@router.get("/{uuid}/summary")
+async def get_summary(
+    uuid: str,
+    data_cache=Depends(get_workbook_data_cache),
+    graphs=Depends(get_workbook_graphs),
+):
+    """Return a comprehensive workbook summary with per-sheet stats, key metrics, quality score, and cross-sheet deps."""
+    if uuid not in data_cache:
+        raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found.")
+
+    workbook_data = data_cache[uuid]
+    graph = graphs.get(uuid)
+
+    total_cells = 0
+    total_formulas = 0
+    total_empty = 0
+    total_anomalies = 0
+    sheets_summary = []
+
+    for sheet_name in workbook_data.sheets:
+        sheet_cells = [c for c in workbook_data.cells.values() if c.sheet_name == sheet_name]
+        cell_count = len(sheet_cells)
+        total_cells += cell_count
+
+        formula_count = sum(1 for c in sheet_cells if c.formula)
+        total_formulas += formula_count
+
+        empty_count = sum(1 for c in sheet_cells if c.value is None and not c.formula)
+        total_empty += empty_count
+
+        number_count = sum(1 for c in sheet_cells if isinstance(c.value, (int, float)) and not c.formula)
+        text_count = sum(1 for c in sheet_cells if isinstance(c.value, str))
+
+        max_row = max((c.row for c in sheet_cells), default=0)
+        max_col = max((c.col for c in sheet_cells), default=0)
+
+        anomaly_count = 0
+        if graph:
+            for c in sheet_cells:
+                addr = c.cell_address
+                if addr in graph.nodes and graph.nodes[addr].get("is_anomaly"):
+                    anomaly_count += 1
+        total_anomalies += anomaly_count
+
+        key_metrics = []
+        for c in sheet_cells:
+            if c.col == 1 and isinstance(c.value, str):
+                label = c.value.strip()
+                label_lower = label.lower()
+                is_key = any(kw in label_lower for kw in [
+                    'total', 'revenue', 'income', 'ebitda', 'wacc', 'npv', 'irr',
+                    'net', 'gross', 'margin', 'growth', 'capex', 'debt', 'equity',
+                    'cost', 'expense', 'profit', 'cash flow', 'fcf',
+                ])
+                if is_key:
+                    from openpyxl.utils import get_column_letter
+                    for vc in range(2, min(max_col + 1, 5)):
+                        val_cell = workbook_data.cells.get(f"{sheet_name}!{get_column_letter(vc)}{c.row}")
+                        if val_cell and val_cell.value is not None:
+                            key_metrics.append({
+                                "label": label,
+                                "cell": f"{get_column_letter(vc)}{c.row}",
+                                "value": val_cell.value,
+                                "has_formula": bool(val_cell.formula),
+                            })
+                            break
+                    if len(key_metrics) >= 8:
+                        break
+
+        sheets_summary.append({
+            "name": sheet_name,
+            "rows": max_row,
+            "cols": max_col,
+            "cell_count": cell_count,
+            "formula_count": formula_count,
+            "number_count": number_count,
+            "text_count": text_count,
+            "empty_count": empty_count,
+            "anomaly_count": anomaly_count,
+            "key_metrics": key_metrics,
+        })
+
+    formula_pct = round((total_formulas / total_cells * 100) if total_cells > 0 else 0, 1)
+    empty_pct = round((total_empty / total_cells * 100) if total_cells > 0 else 0, 1)
+    anomaly_pct = round((total_anomalies / total_cells * 100) if total_cells > 0 else 0, 1)
+
+    quality_score = 100
+    if empty_pct > 30:
+        quality_score -= 20
+    elif empty_pct > 15:
+        quality_score -= 10
+    if formula_pct < 10:
+        quality_score -= 15
+    if anomaly_pct > 5:
+        quality_score -= 20
+    elif anomaly_pct > 2:
+        quality_score -= 10
+    if len(workbook_data.named_ranges) == 0:
+        quality_score -= 5
+    quality_score = max(0, quality_score)
+
+    cross_sheet_deps = []
+    if graph:
+        seen_deps = set()
+        for node in graph.nodes():
+            if "!" not in node:
+                continue
+            src_sheet = node.split("!")[0]
+            for succ in graph.successors(node):
+                if "!" in succ:
+                    dst_sheet = succ.split("!")[0]
+                    if src_sheet != dst_sheet:
+                        pair = (src_sheet, dst_sheet)
+                        if pair not in seen_deps:
+                            seen_deps.add(pair)
+                            cross_sheet_deps.append({"from": src_sheet, "to": dst_sheet})
+
+    return {
+        "workbook_uuid": uuid,
+        "sheet_count": len(workbook_data.sheets),
+        "total_cells": total_cells,
+        "total_formulas": total_formulas,
+        "total_anomalies": total_anomalies,
+        "formula_pct": formula_pct,
+        "empty_pct": empty_pct,
+        "quality_score": quality_score,
+        "named_ranges": len(workbook_data.named_ranges),
+        "sheets": sheets_summary,
+        "cross_sheet_deps": cross_sheet_deps,
+    }
+
+
 @router.get("/{uuid}/download")
 async def download_workbook(
     uuid: str,

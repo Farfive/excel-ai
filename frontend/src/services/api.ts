@@ -236,6 +236,51 @@ export async function diffWorkbooks(uuid: string, fileB: File): Promise<any> {
   return res.json();
 }
 
+export interface SheetMetric {
+  label: string;
+  cell: string;
+  value: number | string;
+  has_formula: boolean;
+}
+
+export interface SheetSummary {
+  name: string;
+  rows: number;
+  cols: number;
+  cell_count: number;
+  formula_count: number;
+  number_count: number;
+  text_count: number;
+  empty_count: number;
+  anomaly_count: number;
+  key_metrics: SheetMetric[];
+}
+
+export interface CrossSheetDep {
+  from: string;
+  to: string;
+}
+
+export interface WorkbookSummaryData {
+  workbook_uuid: string;
+  sheet_count: number;
+  total_cells: number;
+  total_formulas: number;
+  total_anomalies: number;
+  formula_pct: number;
+  empty_pct: number;
+  quality_score: number;
+  named_ranges: number;
+  sheets: SheetSummary[];
+  cross_sheet_deps: CrossSheetDep[];
+}
+
+export async function getSummary(uuid: string): Promise<WorkbookSummaryData> {
+  const res = await fetch(`${BASE_URL}/workbook/${uuid}/summary`);
+  if (!res.ok) throw new Error(`Summary failed: HTTP ${res.status}`);
+  return res.json();
+}
+
 export async function getWorkbookGrid(uuid: string): Promise<{
   sheets: Array<{
     name: string;

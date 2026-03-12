@@ -151,7 +151,7 @@
 }
 
 .issueRow__badge--warning {
-  background-color: #8b4513;
+  background-color: var(--yellow);
   color: #fff;
 }
 
@@ -167,7 +167,7 @@
 }
 
 .issueRow__badge--medium {
-  background-color: #8b4513;
+  background-color: var(--yellow);
   color: #fff;
 }
 

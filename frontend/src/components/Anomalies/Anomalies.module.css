@@ -116,7 +116,7 @@
 }
 
 .anomaly__badge--medium {
-  background-color: #8b4513;
+  background-color: var(--yellow);
   color: #fff;
 }
 
