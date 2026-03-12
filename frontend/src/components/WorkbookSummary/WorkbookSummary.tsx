@@ -21,6 +21,24 @@ function qualityColor(score: number): string {
   return '#DC2626';
 }
 
+function qualityLabel(score: number): { text: string; desc: string } {
+  if (score >= 90) return { text: 'Excellent', desc: 'Well-structured model with strong formula coverage and no significant issues.' };
+  if (score >= 80) return { text: 'Good', desc: 'Solid model structure. Minor improvements possible.' };
+  if (score >= 65) return { text: 'Fair', desc: 'Some structural gaps — check empty cells and formula coverage.' };
+  if (score >= 50) return { text: 'Needs Review', desc: 'Significant issues detected — high empty cell ratio or anomalies.' };
+  return { text: 'Poor', desc: 'Critical quality problems — model needs restructuring.' };
+}
+
+function groupDeps(deps: { from: string; to: string }[]): Map<string, string[]> {
+  const grouped = new Map<string, string[]>();
+  for (const dep of deps) {
+    const list = grouped.get(dep.from) || [];
+    list.push(dep.to);
+    grouped.set(dep.from, list);
+  }
+  return grouped;
+}
+
 function QualityRing({ score }: { score: number }) {
   const r = 26;
   const circ = 2 * Math.PI * r;
@@ -143,7 +161,10 @@ export function WorkbookSummary({ workbookUuid, onSheetClick }: Props): React.Re
       <div className={styles.qualityCard}>
         <QualityRing score={data.quality_score} />
         <div className={styles.qualityInfo}>
-          <span className={styles.qualityInfo__title}>Data Quality Score</span>
+          <span className={styles.qualityInfo__title}>
+            Data Quality Score — <span style={{ color: qualityColor(data.quality_score) }}>{qualityLabel(data.quality_score).text}</span>
+          </span>
+          <span className={styles.qualityInfo__desc}>{qualityLabel(data.quality_score).desc}</span>
           <div className={styles.qualityInfo__detail}>
             <span className={styles.qualityInfo__item}>
               <span className={styles.qualityInfo__dot} style={{ background: '#2563EB' }} />
@@ -165,16 +186,20 @@ export function WorkbookSummary({ workbookUuid, onSheetClick }: Props): React.Re
         </div>
       </div>
 
-      {/* ── Cross-sheet dependencies ── */}
+      {/* ── Cross-sheet dependencies (grouped) ── */}
       {data.cross_sheet_deps.length > 0 && (
         <>
-          <div className={styles.sectionHeader}>Cross-Sheet Dependencies</div>
-          <div className={styles.depsWrap}>
-            {data.cross_sheet_deps.map((dep, i) => (
-              <div className={styles.depArrow} key={i}>
-                <span className={styles.depArrow__from}>{dep.from}</span>
-                <span className={styles.depArrow__icon}>→</span>
-                <span className={styles.depArrow__to}>{dep.to}</span>
+          <div className={styles.sectionHeader}>Cross-Sheet Dependencies ({data.cross_sheet_deps.length})</div>
+          <div className={styles.depsGroupWrap}>
+            {Array.from(groupDeps(data.cross_sheet_deps).entries()).map(([source, targets]) => (
+              <div className={styles.depGroup} key={source}>
+                <span className={styles.depGroup__source}>{source}</span>
+                <span className={styles.depGroup__arrow}>→</span>
+                <div className={styles.depGroup__targets}>
+                  {targets.map(t => (
+                    <span className={styles.depGroup__target} key={t}>{t}</span>
+                  ))}
+                </div>
               </div>
             ))}
           </div>
