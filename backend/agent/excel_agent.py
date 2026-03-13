@@ -251,7 +251,7 @@ class ExcelAgent:
             "written": written_summary,
         }
 
-    def build_cell_index(self, max_rows_per_sheet: int = 25) -> str:
+    def build_cell_index(self, max_rows_per_sheet: int = 40) -> str:
         """Build a SheetCompressor-style cell index with 3-layer context.
 
         Layer 1 — Local: cell labels + adjacent values per row
@@ -378,12 +378,108 @@ class ExcelAgent:
             lines.append(f"\nXREF: {' | '.join(cross_sheet_refs[:20])}")
 
         result = "\n".join(lines)
-        max_chars = 2500
+        max_chars = 5000
         if len(result) > max_chars:
             result = result[:max_chars] + "\n...(truncated)"
         return result
 
+    def _try_parse_explicit_table(self, query: str) -> Optional[List[Dict]]:
+        """If the query explicitly lists cell=value assignments, build a plan directly.
+        Handles patterns like: Create sheet 'X'. Write A1=Year B1=Revenue A2=2021 B2=144
+        Returns a plan list or None if pattern not detected.
+        """
+        # Detect create sheet
+        sheet_match = re.search(r"(?:create|new)\s+sheet\s+['\"]?(\w[\w\s]*?)['\"]?[\.\s]", query, re.IGNORECASE)
+        sheet_name = sheet_match.group(1).strip() if sheet_match else None
+
+        # Find all CELL=VALUE pairs: e.g. A1=Year, B2=155.5, C3=0.08
+        cell_val_pattern = re.compile(r'\b([A-Z]{1,3}\d{1,4})=([^\s]+)', re.IGNORECASE)
+        pairs = cell_val_pattern.findall(query)
+        if len(pairs) < 3:
+            return None  # Not enough explicit assignments — let LLM handle it
+
+        steps: List[Dict] = []
+        step_num = 0
+
+        if sheet_name:
+            step_num += 1
+            steps.append({"step": step_num, "tool": "create_sheet", "args": {"name": sheet_name}, "reason": f"Create sheet {sheet_name}"})
+
+        sheet = sheet_name or (self.workbook_data.sheets[0] if self.workbook_data.sheets else "Sheet1")
+
+        # Coerce values
+        def coerce(v: str):
+            try:
+                f = float(v)
+                return int(f) if f == int(f) else f
+            except ValueError:
+                return v.strip("'\"")
+
+        # Group by row to write row-by-row (more efficient)
+        from collections import defaultdict
+        rows: dict = defaultdict(dict)
+        col_order: dict = defaultdict(list)
+        for cell, val in pairs:
+            col_match = re.match(r'^([A-Za-z]+)(\d+)$', cell)
+            if col_match:
+                col = col_match.group(1).upper()
+                row = int(col_match.group(2))
+                rows[row][col] = coerce(val)
+                if col not in col_order[row]:
+                    col_order[row].append(col)
+
+        from openpyxl.utils import column_index_from_string, get_column_letter
+        for row_num in sorted(rows.keys()):
+            cols_in_row = sorted(rows[row_num].keys(), key=lambda c: column_index_from_string(c))
+            if not cols_in_row:
+                continue
+            # Check if columns are contiguous
+            col_indices = [column_index_from_string(c) for c in cols_in_row]
+            is_contiguous = (max(col_indices) - min(col_indices) + 1) == len(col_indices)
+
+            if is_contiguous and len(cols_in_row) > 1:
+                start_col = get_column_letter(min(col_indices))
+                end_col = get_column_letter(max(col_indices))
+                range_str = f"{start_col}{row_num}:{end_col}{row_num}"
+                vals = [rows[row_num][c] for c in cols_in_row]
+                step_num += 1
+                steps.append({"step": step_num, "tool": "write_range",
+                               "args": {"sheet": sheet, "range": range_str, "values": vals},
+                               "reason": f"Write row {row_num}"})
+            else:
+                for col in cols_in_row:
+                    step_num += 1
+                    steps.append({"step": step_num, "tool": "write_range",
+                                  "args": {"sheet": sheet, "range": f"{col}{row_num}", "values": [rows[row_num][col]]},
+                                  "reason": f"Write {col}{row_num}"})
+
+        # Also detect explicit formula patterns: "write formula =SUM(A1:A5) in B1" or "formula =X in CELL"
+        formula_pattern = re.compile(
+            r'(?:write\s+)?formula\s+=?([A-Z]+\([^)]+\))\s+in\s+([A-Z]{1,3}\d{1,4})',
+            re.IGNORECASE
+        )
+        for fm in formula_pattern.finditer(query):
+            formula_str = fm.group(1).strip()
+            cell_addr = fm.group(2).upper()
+            step_num += 1
+            steps.append({"step": step_num, "tool": "write_formula",
+                           "args": {"sheet": sheet, "cell": cell_addr, "formula": formula_str},
+                           "reason": f"Write formula {formula_str} in {cell_addr}"})
+
+        logger.info(f"_try_parse_explicit_table: built {len(steps)} steps from {len(pairs)} cell assignments")
+        return steps
+
     async def plan(self, query: str, context: str, cell_index: str) -> List[Dict]:
+        # Fast path: if query has explicit CELL=VALUE assignments, build plan directly
+        explicit_plan = self._try_parse_explicit_table(query)
+        if explicit_plan:
+            try:
+                plan_model = PlanModel(steps=[ToolStepModel(**s) for s in explicit_plan])
+                logger.info(f"Explicit table plan: {len(plan_model.steps)} steps (bypassed LLM)")
+                return [s.dict() for s in plan_model.steps]
+            except Exception as e:
+                logger.warning(f"Explicit plan validation failed: {e}, falling back to LLM")
+
         system = (
             SYSTEM_PROMPT
             + "\n" + cell_index
@@ -398,9 +494,16 @@ class ExcelAgent:
                 "content": (
                     f"RAG Context:\n{context}\n\n"
                     f"User request: {query}\n\n"
-                    "Create a precise step-by-step plan as a JSON array. "
-                    "Use the CELL INDEX to find exact cell addresses. "
-                    "For write operations, always specify values as a list."
+                    "Return ONLY a JSON array. Format example for writing a table row by row:\n"
+                    '[{"step":1,"tool":"create_sheet","args":{"name":"Sheet1"},"reason":"..."},'
+                    '{"step":2,"tool":"write_range","args":{"sheet":"Sheet1","range":"A1:C1","values":["Year","Revenue","Growth"]},"reason":"header row"},'
+                    '{"step":3,"tool":"write_range","args":{"sheet":"Sheet1","range":"A2:C2","values":[2021,144,0]},"reason":"data row 1"},'
+                    '{"step":4,"tool":"write_formula","args":{"sheet":"Sheet1","cell":"B1","formula":"SUM(A1:A5)"},"reason":"formula"}]\n'
+                    "CRITICAL RULES:\n"
+                    "1. NEVER use write_table — always use write_range with one row at a time.\n"
+                    "2. args MUST use exact keys: name / sheet / range / values / cell / formula.\n"
+                    "3. values is always a flat list (one row of values per step).\n"
+                    "4. No markdown fences. Output ONLY the JSON array."
                 ),
             }
         ]
@@ -412,12 +515,16 @@ class ExcelAgent:
                     messages=messages, system=system, temperature=0.0,
                 )
                 parsed = self._parse_plan_json(response)
+                logger.info(f"_parse_plan_json: {len(parsed)} raw steps: {[s.get('tool') for s in parsed]}")
+                parsed = self._normalize_plan(parsed)
+                logger.info(f"_normalize_plan: {len(parsed)} steps: {[s.get('tool') for s in parsed]}")
                 plan_model = PlanModel(steps=[ToolStepModel(**s) for s in parsed])
                 logger.info(f"Plan validated OK (attempt {attempt + 1}): {len(plan_model.steps)} steps")
                 return [s.dict() for s in plan_model.steps]
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"Plan validation failed (attempt {attempt + 1}/3): {last_error}")
+                resp_preview = repr(response[:200]) if 'response' in dir() and response else repr(response if 'response' in dir() else "<unset>")
+                logger.warning(f"Plan validation failed (attempt {attempt + 1}/3): {last_error} | response={resp_preview}")
                 messages.append({"role": "assistant", "content": response if 'response' in dir() else ""})
                 messages.append({
                     "role": "user",
@@ -438,16 +545,64 @@ class ExcelAgent:
         cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
         cleaned = cleaned.strip()
 
-        arr_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-        if arr_match:
-            cleaned = arr_match.group(0)
+        # Find start of outer JSON array using bracket matching
+        start = cleaned.find('[')
+        candidate = cleaned[start:] if start != -1 else cleaned
 
-        data = json.loads(cleaned)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "steps" in data:
-            return data["steps"]
-        return [data]
+        # 1) Try full parse
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and "steps" in data:
+                return data["steps"]
+            return [data]
+        except json.JSONDecodeError:
+            pass
+
+        # 2) Truncated recovery: strip incomplete last step objects one by one
+        # Find last complete '}' at top level (depth 1 inside outer array)
+        # Strategy: keep chopping from last '}' until we can close with ']'
+        probe = candidate
+        for _ in range(20):
+            last_brace = probe.rfind('}')
+            if last_brace == -1:
+                break
+            attempt = probe[:last_brace + 1] + ']'
+            try:
+                data = json.loads(attempt)
+                if isinstance(data, list) and data:
+                    return data
+            except json.JSONDecodeError:
+                pass
+            probe = probe[:last_brace]
+
+        # 3) Last resort: extract complete step objects via nested-brace matching
+        steps = []
+        i = 0
+        while i < len(candidate):
+            if candidate[i] == '{':
+                depth, j = 0, i
+                while j < len(candidate):
+                    if candidate[j] == '{': depth += 1
+                    elif candidate[j] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = json.loads(candidate[i:j+1])
+                                if "tool" in obj:
+                                    steps.append(obj)
+                            except json.JSONDecodeError:
+                                pass
+                            break
+                    j += 1
+                i = j + 1
+            else:
+                i += 1
+        if steps:
+            return steps
+
+        raise json.JSONDecodeError("Could not parse plan JSON", candidate, 0)
 
     def _validate_step_args(self, step: Dict) -> Optional[ToolResult]:
         """Pre-validate step arguments. Returns error ToolResult or None if OK."""
@@ -497,9 +652,132 @@ class ExcelAgent:
 
         return None
 
+    def _normalize_plan(self, steps: List[Dict]) -> List[Dict]:
+        """Normalize all steps in a plan before Pydantic validation."""
+        from openpyxl.utils import get_column_letter
+        last_created_sheet: Optional[str] = None
+        normalized = []
+        step_counter = 0
+
+        for i, s in enumerate(steps):
+            if not isinstance(s, dict):
+                continue
+            if "reason" not in s:
+                s["reason"] = ""
+            tool = s.get("tool", "")
+            args = s.get("args", {})
+            if not isinstance(args, dict):
+                args = {}
+
+            # write_table / set_table aliases → expand into individual write_range steps
+            if tool in ("write_table", "set_table", "fill_table", "write_data"):
+                args = self._normalize_args("write_range", args)
+                sheet = args.get("sheet") or last_created_sheet or "Sheet1"
+                values_2d = args.get("values", [])
+                range_str = args.get("range", "A1")
+                # Parse start cell
+                start_match = re.match(r"^([A-Za-z]+)(\d+)", range_str)
+                start_col = 1
+                start_row = 1
+                if start_match:
+                    for ci, ch in enumerate(start_match.group(1).upper()):
+                        start_col = start_col * 26 + (ord(ch) - ord('A') + 1)
+                    start_col -= 26  # undo extra mult on first iter
+                    start_row = int(start_match.group(2))
+                    # Simple single-letter col
+                    col_str = start_match.group(1).upper()
+                    start_col = sum((ord(c) - ord('A') + 1) * (26 ** (len(col_str)-1-j)) for j, c in enumerate(col_str))
+                if isinstance(values_2d, list) and values_2d:
+                    for ri, row_vals in enumerate(values_2d):
+                        if not isinstance(row_vals, list):
+                            row_vals = [row_vals]
+                        for ci, val in enumerate(row_vals):
+                            col_letter = get_column_letter(start_col + ci)
+                            cell_addr = f"{col_letter}{start_row + ri}"
+                            step_counter += 1
+                            normalized.append({
+                                "step": step_counter,
+                                "tool": "write_range",
+                                "args": {"sheet": sheet, "range": cell_addr, "values": [val]},
+                                "reason": s.get("reason", ""),
+                            })
+                continue
+
+            args = self._normalize_args(tool, args)
+            # Track last created sheet
+            if tool == "create_sheet":
+                name = args.get("name")
+                if name:
+                    last_created_sheet = name
+            # Inject missing sheet
+            if tool in ("write_range", "write_formula", "read_range", "delete_range"):
+                if "sheet" not in args:
+                    candidate = args.pop("name", None) or last_created_sheet
+                    if candidate:
+                        args["sheet"] = candidate
+                        logger.info(f"Auto-injected sheet '{candidate}' into step {i+1}")
+            s["args"] = args
+            step_counter += 1
+            s["step"] = step_counter
+            normalized.append(s)
+        return normalized
+
+    def _normalize_args(self, tool_name: str, args: Dict) -> Dict:
+        """Normalize arg key aliases from local models that use non-standard key names."""
+        # create_sheet: name — ONLY for create_sheet, never steal 'sheet' from write ops
+        if tool_name == "create_sheet":
+            for alt in ("sheetName", "sheet_name"):
+                if "name" not in args and alt in args:
+                    args["name"] = args.pop(alt)
+                    break
+        # write_range / read_range / delete_range / write_formula: range or cell
+        range_alts = ("cellAddress", "cellIndex", "cell_range", "cellRange",
+                      "cells", "cell_address", "address", "cell_ref", "cellRef")
+        if tool_name == "write_formula":
+            for alt in range_alts:
+                if "cell" not in args and alt in args:
+                    args["cell"] = args.pop(alt)
+                    break
+        else:
+            for alt in range_alts:
+                if "range" not in args and alt in args:
+                    args["range"] = args.pop(alt)
+                    break
+        # sheet key aliases
+        for alt in ("sheetName", "sheet_name", "worksheet", "sheetname"):
+            if "sheet" not in args and alt in args:
+                args["sheet"] = args.pop(alt)
+                break
+        # write_range: values aliases + ensure list + coerce string numerics
+        if tool_name == "write_range":
+            for alt in ("value", "data", "cell_values", "cellValues"):
+                if "values" not in args and alt in args:
+                    args["values"] = args.pop(alt)
+                    break
+            if "values" in args and not isinstance(args["values"], list):
+                args["values"] = [args["values"]]
+            if "values" in args:
+                coerced = []
+                for v in args["values"]:
+                    if isinstance(v, str) and not v.startswith("="):
+                        try:
+                            coerced.append(int(v) if "." not in v else float(v))
+                        except (ValueError, TypeError):
+                            coerced.append(v)
+                    else:
+                        coerced.append(v)
+                args["values"] = coerced
+        # write_formula: strip leading = if present (model sometimes adds it)
+        if tool_name == "write_formula" and "formula" in args:
+            f = args["formula"]
+            if isinstance(f, str) and f.startswith("="):
+                args["formula"] = f[1:]
+        return args
+
     def execute_step(self, step: Dict) -> ToolResult:
         tool_name = step.get("tool", "")
-        args = step.get("args", {})
+        args = self._normalize_args(tool_name, step.get("args", {}))
+        step["args"] = args
 
         validation_error = self._validate_step_args(step)
         if validation_error is not None:
@@ -734,8 +1012,8 @@ class ExcelAgent:
         yield {"event": "retrieving", "data": {"message": "Retrieving relevant context..."}}
 
         try:
-            chunks = await self.retriever.retrieve(query, workbook_uuid, k=5, workbook_data=self.workbook_data)
-            context = self.retriever.build_context(chunks, query)
+            chunks = await self.retriever.retrieve(query, workbook_uuid, k=15, workbook_data=self.workbook_data)
+            context = self.retriever.build_context(chunks, query, max_chars=12000)
         except Exception as e:
             logger.error(f"Retrieval failed: {e}")
             context = "No context available."
@@ -778,7 +1056,7 @@ class ExcelAgent:
                 return
             # Agent mode: auto-execute, no approval needed
         else:
-            plan = approved_plan
+            plan = self._normalize_plan(approved_plan)
 
         yield {"event": "executing_plan", "data": {"message": f"Executing {len(plan)} steps...", "step_count": len(plan)}}
 

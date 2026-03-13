@@ -13,7 +13,7 @@ import os
 from api.dependencies import (
     get_embedder, get_chroma, get_ollama, get_lsh,
     get_workbook_graphs, get_workbook_data_cache, get_workbook_states,
-    get_audit_trails,
+    get_audit_trails, get_cgasr_indices,
 )
 from api.models import (
     AskRequest, DeltaRequest, StateRequest, StateResponse,
@@ -24,6 +24,7 @@ from parser.graph_builder import DependencyGraphBuilder
 from rag.chunker import ChunkBuilder
 from rag.chroma_store import ChunkRecord
 from rag.retrieval import RAGRetriever
+from rag.cgasr_index import build_cgasr_index
 from agent.excel_agent import ExcelAgent
 from agent.tools import ExcelTools
 from db.connection import get_db, WorkbookSession
@@ -41,6 +42,7 @@ async def upload_workbook(
     lsh=Depends(get_lsh),
     graphs=Depends(get_workbook_graphs),
     data_cache=Depends(get_workbook_data_cache),
+    cgasr_store=Depends(get_cgasr_indices),
     db: AsyncSession = Depends(get_db),
 ):
     if not file.filename or not file.filename.endswith(".xlsx"):
@@ -93,6 +95,18 @@ async def upload_workbook(
         except Exception as e:
             logger.warning(f"BM25 index build skipped: {e}")
 
+        # Build CGASR spectral index
+        try:
+            import numpy as np
+            emb_matrix = np.array(embeddings, dtype=np.float32)
+            cgasr_idx = build_cgasr_index(
+                workbook_data, graph, existing_embeddings=emb_matrix,
+            )
+            cgasr_store[workbook_uuid] = cgasr_idx
+            logger.info(f"CGASR index built: N={cgasr_idx.N}, K={cgasr_idx.K}, {cgasr_idx.build_time_ms}ms")
+        except Exception as e:
+            logger.warning(f"CGASR index build failed (retrieval will use fallback): {e}")
+
         anomaly_count = sum(
             1 for n in graph.nodes() if graph.nodes[n].get("is_anomaly")
         )
@@ -135,13 +149,16 @@ async def ask(
     data_cache=Depends(get_workbook_data_cache),
     states=Depends(get_workbook_states),
     audit_trails=Depends(get_audit_trails),
+    cgasr_store=Depends(get_cgasr_indices),
 ):
     if uuid not in graphs:
         raise HTTPException(status_code=404, detail=f"Workbook {uuid} not found. Upload first.")
 
     graph = graphs[uuid]
     workbook_data = data_cache[uuid]
-    workbook_state = states.get(uuid, {})
+    if uuid not in states:
+        states[uuid] = {}
+    workbook_state = states[uuid]
 
     from analysis.audit_trail import AuditTrail
     if uuid not in audit_trails:
@@ -149,7 +166,11 @@ async def ask(
     trail = audit_trails[uuid]
 
     tools = ExcelTools(workbook_state=workbook_state, graph=graph, workbook_data=workbook_data)
-    retriever = RAGRetriever(embedder=embedder, store=chroma, ollama_client=ollama_client, graph=graph)
+    cgasr_idx = cgasr_store.get(uuid)
+    retriever = RAGRetriever(
+        embedder=embedder, store=chroma, ollama_client=ollama_client,
+        graph=graph, cgasr_index=cgasr_idx,
+    )
     retriever.build_bm25_index(uuid)
     agent = ExcelAgent(ollama=ollama_client, retriever=retriever, tools=tools, workbook_data=workbook_data)
 

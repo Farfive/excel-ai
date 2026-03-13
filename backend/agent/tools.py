@@ -69,8 +69,15 @@ class ExcelTools:
             # Normalize values: list → zip with resolved cells; single value → broadcast
             if isinstance(values, list):
                 resolved = self._resolve_range(sheet, range_str)
+                # Flatten 2D list (list of rows) into 1D
+                flat: List[Any] = []
+                for item in values:
+                    if isinstance(item, list):
+                        flat.extend(item)
+                    else:
+                        flat.append(item)
                 values_dict: Dict[str, Any] = {}
-                for addr, val in zip(resolved, values):
+                for addr, val in zip(resolved, flat):
                     short_addr = addr.split("!")[-1]
                     values_dict[short_addr] = val
                 values = values_dict
@@ -112,10 +119,16 @@ class ExcelTools:
                     "after": val,
                 })
 
+                # Detect formula strings (=...) and handle correctly
+                is_formula = isinstance(val, str) and val.startswith("=")
+                formula_str = val[1:] if is_formula else None
+                stored_value = val if is_formula else val
+
                 # Mutate workbook_data.cells so /grid reflects changes
                 if full_addr in self.workbook_data.cells:
-                    self.workbook_data.cells[full_addr].value = val
-                    self.workbook_data.cells[full_addr].data_type = _infer_data_type(val, None)
+                    self.workbook_data.cells[full_addr].value = stored_value
+                    self.workbook_data.cells[full_addr].formula = formula_str
+                    self.workbook_data.cells[full_addr].data_type = _infer_data_type(stored_value, formula_str)
                     self.workbook_data.cells[full_addr].is_hardcoded = isinstance(val, (int, float))
                 else:
                     col_part = "".join(c for c in addr if c.isalpha())
@@ -126,9 +139,9 @@ class ExcelTools:
                         self.workbook_data.cells[full_addr] = CellData(
                             cell_address=full_addr,
                             sheet_name=sheet,
-                            value=val,
-                            formula=None,
-                            data_type=_infer_data_type(val, None),
+                            value=stored_value,
+                            formula=formula_str,
+                            data_type=_infer_data_type(stored_value, formula_str),
                             named_range=None,
                             row=row_idx,
                             col=col_idx,
@@ -137,7 +150,7 @@ class ExcelTools:
                             merge_master=None,
                         )
 
-                self.workbook_state[full_addr] = {"value": val, "formula": None, "data_type": _infer_data_type(val, None)}
+                self.workbook_state[full_addr] = {"value": stored_value, "formula": formula_str, "data_type": _infer_data_type(stored_value, formula_str)}
 
             return ToolResult(
                 tool_name="write_range",

@@ -26,7 +26,6 @@ class Settings(BaseSettings):
         )
 
 
-@lru_cache()
 def get_settings() -> Settings:
     settings = Settings()
     settings.configure_logging()

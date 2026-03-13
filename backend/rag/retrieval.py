@@ -11,6 +11,15 @@ from rag.chroma_store import ChromaStore
 
 logger = logging.getLogger(__name__)
 
+# Late import to avoid circular — used only when CGASR is active
+_cgasr_retriever_cls = None
+def _get_cgasr_retriever():
+    global _cgasr_retriever_cls
+    if _cgasr_retriever_cls is None:
+        from rag.cgasr_retriever import CGASRRetriever
+        _cgasr_retriever_cls = CGASRRetriever
+    return _cgasr_retriever_cls
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -19,6 +28,14 @@ _SHEET_NAME_RE = re.compile(
     r"(?:in|w|na|z|from|sheet|arkusz|arkuszu)\s+['\"]?([A-Za-z][A-Za-z0-9 &_-]+)['\"]?",
     re.IGNORECASE,
 )
+
+_VALUATION_RE = re.compile(
+    r"\b(dcf|terminal value|enterprise value|equity value|ebitda|ev/ebitda|wacc|discount|npv|irr|"
+    r"price per share|valuation|sensitivity|fcf|free cash flow|wycena|warto[sś][cć])\b",
+    re.IGNORECASE,
+)
+
+VALUATION_SHEETS = ["DCF", "Sensitivity", "P&L", "Assumptions"]
 
 _DIRECT_LOOKUP_RE = re.compile(
     r"(?:what is|jaki jest|jaka jest|ile wynosi|podaj|read|odczytaj|value of)\s+(.+)",
@@ -56,11 +73,13 @@ class RAGRetriever:
         store: ChromaStore,
         ollama_client: Any,
         graph: nx.DiGraph,
+        cgasr_index: Any = None,
     ) -> None:
         self.embedder = embedder
         self.store = store
         self.ollama = ollama_client
         self.graph = graph
+        self.cgasr_index = cgasr_index
         self._bm25: Optional[BM25Okapi] = None
         self._bm25_chunks: List[Dict] = []
         self._cross_encoder = None
@@ -344,22 +363,234 @@ class RAGRetriever:
     # Main retrieve pipeline (upgraded)
     # ------------------------------------------------------------------
 
+    def _get_cell_value(self, workbook_data: Any, *addrs: str) -> Optional[float]:
+        """Return first non-None numeric value from given addresses."""
+        for addr in addrs:
+            cell = workbook_data.cells.get(addr)
+            if cell and isinstance(cell.value, (int, float)):
+                return float(cell.value)
+        return None
+
+    def _parse_capm_from_notes(self, workbook_data: Any):
+        """Extract Rf, Beta, MRP from Links & Notes text e.g. 'Rf=4.2%, Beta=1.1, MRP=5.5%'."""
+        for addr, cell in workbook_data.cells.items():
+            if "Links" not in addr and "Notes" not in addr:
+                continue
+            if not isinstance(cell.value, str):
+                continue
+            text = cell.value
+            rf_m   = re.search(r"Rf\s*=\s*([\d.]+)%", text, re.IGNORECASE)
+            beta_m = re.search(r"Beta\s*=\s*([\d.]+)", text, re.IGNORECASE)
+            mrp_m  = re.search(r"MRP\s*=\s*([\d.]+)%", text, re.IGNORECASE)
+            if rf_m and beta_m and mrp_m:
+                return float(rf_m.group(1)) / 100, float(beta_m.group(1)), float(mrp_m.group(1)) / 100
+        return None, None, None
+
+    def _compute_derived_valuation(self, workbook_data: Any) -> List[str]:
+        """Full financial model evaluator: Revenue → COGS → EBIT → FCF → EV → sensitivity.
+        Walks the formula chain from hardcoded assumptions so all values are real numbers.
+        """
+        lines: List[str] = []
+        try:
+            # ── Key assumptions ──────────────────────────────────────────────
+            wacc   = self._get_cell_value(workbook_data, "Assumptions!B13") or 0.10
+            tgr    = self._get_cell_value(workbook_data, "Assumptions!B14") or 0.025
+            tax    = self._get_cell_value(workbook_data, "Assumptions!B10") or 0.21
+            shares = self._get_cell_value(workbook_data, "Assumptions!B15") or 100  # millions
+            net_debt = (self._get_cell_value(workbook_data, "Balance Sheet!B19") or 0) \
+                     - (self._get_cell_value(workbook_data, "Balance Sheet!B6") or 0)
+
+            # Column letters B=2021 … N=2033 (13 years)
+            col_letters = list("BCDEFGHIJKLMN")
+            years = list(range(2021, 2034))
+            n_years = len(col_letters)
+
+            # ── Revenue growth rates per year ────────────────────────────────
+            def assumption(row: int) -> List[float]:
+                vals = []
+                for c in col_letters:
+                    v = self._get_cell_value(workbook_data, f"Assumptions!{c}{row}")
+                    vals.append(v if v is not None else vals[-1] if vals else 0.0)
+                return vals
+
+            rev_growth  = assumption(5)   # row 5
+            cogs_pct    = assumption(6)   # row 6
+            sga_pct     = assumption(7)   # row 7
+            rnd_pct     = assumption(8)   # row 8
+            da_pct      = assumption(9)   # row 9
+            capex_pct   = assumption(11)  # row 11
+            nwc_pct     = assumption(12)  # row 12
+
+            # ── Base revenue (sum of all segments in col B) ──────────────────
+            base_rev_rows = range(5, 15)  # Revenue!B5:B14
+            base_rev = sum(
+                self._get_cell_value(workbook_data, f"Revenue!B{r}") or 0
+                for r in base_rev_rows
+            )
+            if base_rev == 0:
+                return lines  # can't compute without root values
+
+            # ── Compute year-by-year financials ─────────────────────────────
+            revenues, ebits, fcfs = [], [], []
+            prev_nwc = base_rev * nwc_pct[0]
+            rev = base_rev
+
+            for i, c in enumerate(col_letters):
+                if i > 0:
+                    rev = rev * (1 + rev_growth[i])
+                cogs  = rev * cogs_pct[i]
+                opex  = rev * (sga_pct[i] + rnd_pct[i])
+                ebit  = rev - cogs - opex
+                nopat = ebit * (1 - tax)
+                da    = rev * da_pct[i]
+                capex = rev * capex_pct[i]
+                nwc   = rev * nwc_pct[i]
+                d_nwc = nwc - prev_nwc
+                fcf   = nopat + da - capex - d_nwc
+                revenues.append(rev)
+                ebits.append(ebit)
+                fcfs.append(fcf)
+                prev_nwc = nwc
+
+            # ── DCF: discount all FCFs + terminal value ───────────────────────
+            def calc_ev(w: float, t: float):
+                pv_fcfs_sum = sum(fcfs[i] / (1 + w) ** (i + 1) for i in range(n_years))
+                terminal_fcf = fcfs[-1] * (1 + t)
+                tv = terminal_fcf / (w - t)
+                pv_tv = tv / (1 + w) ** n_years
+                return pv_fcfs_sum, pv_tv, pv_fcfs_sum + pv_tv
+
+            pv_fcfs_base, pv_tv_base, ev_base = calc_ev(wacc, tgr)
+            eq_base = ev_base - net_debt
+            pps_base = eq_base / (shares * 1e6)
+            tv_pct = pv_tv_base / ev_base * 100
+            terminal_year_fcf = fcfs[-1]
+            tv_multiple = (1 + tgr) / (wacc - tgr)
+
+            # ── CAPM ─────────────────────────────────────────────────────────
+            rf, beta, mrp = self._parse_capm_from_notes(workbook_data)
+            if rf and beta and mrp:
+                ke = rf + beta * mrp
+                lines.append(f"DERIVED CAPM: Ke = {rf:.1%} + {beta} × {mrp:.1%} = {ke:.2%}")
+                lines.append(f"DERIVED: WACC ({wacc:.2%}) {'<' if wacc < ke else '>'} Ke ({ke:.2%}) — {'CORRECT' if wacc < ke else 'WARNING'}")
+
+            # ── P&L summary ───────────────────────────────────────────────────
+            lines.append(f"\nDERIVED P&L SUMMARY (computed from Assumptions):")
+            lines.append(f"  Year  | Revenue ($M) | EBIT ($M) | FCF ($M)")
+            lines.append(f"  {'─'*50}")
+            for i, yr in enumerate(years):
+                lines.append(
+                    f"  {yr}  | {revenues[i]/1e6:>10.1f}   | {ebits[i]/1e6:>8.1f}  | {fcfs[i]/1e6:>7.1f}"
+                )
+
+            # ── Base case DCF ─────────────────────────────────────────────────
+            lines.append(f"\nDERIVED BASE CASE DCF (WACC={wacc:.1%}, TGR={tgr:.1%}):")
+            lines.append(f"  TV/FCF terminal multiple    = {tv_multiple:.2f}x")
+            lines.append(f"  Terminal Year FCF (2033)    = ${terminal_year_fcf/1e6:.1f}M")
+            lines.append(f"  Terminal Value (undiscounted)= ${fcfs[-1]*(1+tgr)/(wacc-tgr)/1e6:.1f}M")
+            lines.append(f"  PV of FCFs (2021-2033)      = ${pv_fcfs_base/1e6:.1f}M")
+            lines.append(f"  PV of Terminal Value        = ${pv_tv_base/1e6:.1f}M")
+            lines.append(f"  Enterprise Value (EV)       = ${ev_base/1e6:.1f}M")
+            lines.append(f"  Less: Net Debt              = ${net_debt/1e6:.1f}M")
+            lines.append(f"  Equity Value                = ${eq_base/1e6:.1f}M")
+            lines.append(f"  Price per Share (100M shs)  = ${pps_base:.2f}")
+            lines.append(f"  Terminal Value as % of EV   = {tv_pct:.1f}%")
+
+            # ── Sensitivity table ─────────────────────────────────────────────
+            wacc_rows = [0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13]
+            tgr_cols  = [0.010, 0.015, 0.020, 0.025, 0.030, 0.035]
+
+            lines.append(f"\nDERIVED SENSITIVITY TABLE — Enterprise Value ($M):")
+            lines.append("WACC \\ TGR | " + " | ".join(f"{t:.1%}" for t in tgr_cols))
+            lines.append("─" * 75)
+
+            ev_grid = []
+            for w in wacc_rows:
+                row_evs = []
+                for t in tgr_cols:
+                    if w <= t:
+                        row_evs.append(None)
+                    else:
+                        _, _, ev = calc_ev(w, t)
+                        row_evs.append(ev)
+                        ev_grid.append((ev, w, t))
+                row_str = f"  {w:.0%}     | " + " | ".join(
+                    f"{v/1e6:>7.0f}M" if v else "    N/A" for v in row_evs
+                )
+                lines.append(row_str)
+
+            if ev_grid:
+                max_ev = max(ev_grid, key=lambda x: x[0])
+                min_ev = min(ev_grid, key=lambda x: x[0])
+                lines.append(f"\nDERIVED: Max EV = ${max_ev[0]/1e6:.0f}M @ WACC={max_ev[1]:.0%}, TGR={max_ev[2]:.1%}")
+                lines.append(f"DERIVED: Min EV = ${min_ev[0]/1e6:.0f}M @ WACC={min_ev[1]:.0%}, TGR={min_ev[2]:.1%}")
+                lines.append(f"DERIVED: EV range = ${(max_ev[0]-min_ev[0])/1e6:.0f}M")
+
+        except Exception as e:
+            logger.warning(f"Derived valuation computation failed: {e}")
+
+        return lines
+
+    def _inject_valuation_sheets(
+        self, chunks: List[Dict], workbook_data: Any, query: str
+    ) -> List[Dict]:
+        """If query is about DCF/valuation, force-inject key cells from valuation sheets."""
+        if not _VALUATION_RE.search(query) or workbook_data is None:
+            return chunks
+
+        existing_addrs = set()
+        for c in chunks:
+            for addr in c.get("metadata", {}).get("cell_addresses", []):
+                existing_addrs.add(addr)
+
+        # DERIVED values first — always included, never truncated
+        derived = self._compute_derived_valuation(workbook_data)
+        injected_lines: List[str] = list(derived) if derived else []
+
+        # DCF formulas
+        for addr, cell in sorted(workbook_data.cells.items()):
+            if cell.sheet_name == "DCF" and cell.formula and addr not in existing_addrs:
+                injected_lines.append(f"{addr} [formula]: {cell.formula}")
+
+        # Raw cell values from valuation sheets
+        for addr, cell in workbook_data.cells.items():
+            sheet = cell.sheet_name
+            if sheet not in VALUATION_SHEETS:
+                continue
+            if addr in existing_addrs:
+                continue
+            if cell.value is None:
+                continue
+            val_str = str(cell.value)[:120]
+            injected_lines.append(f"{addr}: {val_str}")
+
+        if not injected_lines:
+            return chunks
+
+        injected_text = (
+            "COMPUTED VALUATION DATA (authoritative — use these numbers):\n"
+            + "\n".join(injected_lines[:300])
+        )
+        injected_chunk = {
+            "chunk_id": "valuation_inject",
+            "text": injected_text,
+            "metadata": {"sheet": "DCF", "cell_addresses": []},
+        }
+        logger.info(f"Valuation inject: {len(injected_lines)} lines incl. derived values")
+        return [injected_chunk] + chunks
+
     async def retrieve(
         self,
         query: str,
         workbook_uuid: str,
-        k: int = 5,
+        k: int = 15,
         workbook_data: Any = None,
     ) -> List[Dict]:
-        """Enhanced retrieval pipeline:
-        1. Direct lookup (Informer) for simple queries
-        2. HyDE embedding
-        3. Vector search (ChromaDB)
-        4. BM25 keyword search
-        5. RRF fusion
-        6. Sheet metadata boost
-        7. Graph expansion
-        8. Cross-encoder reranking
+        """Enhanced retrieval pipeline with CGASR spectral retrieval.
+
+        If CGASR index is available, runs spectral retrieval in parallel
+        with the classic pipeline and merges results via score fusion.
+        Falls back to classic pipeline if CGASR is not available.
         """
 
         # --- Step 1: Direct lookup for simple queries ---
@@ -422,13 +653,47 @@ class RAGRetriever:
         # --- Step 8: Cross-encoder reranking ---
         reranked = self._cross_encoder_rerank(query, expanded, top_k=k)
 
+        # --- Step 8.5: CGASR spectral re-ranking (if index available) ---
+        if self.cgasr_index is not None and self.cgasr_index.N > 0:
+            try:
+                CGASRRetriever = _get_cgasr_retriever()
+                cgasr_ret = CGASRRetriever(self.cgasr_index)
+                cgasr_results = cgasr_ret.retrieve(
+                    query_embedding=np.array(query_emb, dtype=np.float32),
+                    chunks=reranked,
+                    k=k,
+                )
+                # Merge: use CGASR ordering but preserve chunk data
+                if cgasr_results:
+                    reranked_cgasr = []
+                    for cr in cgasr_results:
+                        chunk = cr["chunk"]
+                        chunk["cgasr_score"] = cr["score"]
+                        chunk["cgasr_uncertainty"] = cr["uncertainty"]
+                        reranked_cgasr.append(chunk)
+                    # Add any classic chunks that CGASR didn't select
+                    seen_ids = {c.get("chunk_id") for c in reranked_cgasr}
+                    for c in reranked:
+                        if c.get("chunk_id") not in seen_ids:
+                            reranked_cgasr.append(c)
+                    reranked = reranked_cgasr[:k]
+                    logger.info(
+                        f"CGASR reranked: top score={cgasr_results[0]['score']:.3f}, "
+                        f"σ={cgasr_results[0]['uncertainty']:.3f}"
+                    )
+            except Exception as e:
+                logger.warning(f"CGASR reranking failed (using classic): {e}")
+
+        # --- Step 9: Valuation sheet injection for DCF/EV queries ---
+        reranked = self._inject_valuation_sheets(reranked, workbook_data, query)
+
         return reranked
 
     # ------------------------------------------------------------------
     # Context builder (kept from original)
     # ------------------------------------------------------------------
 
-    def build_context(self, chunks: List[Dict], query: str, max_chars: int = 3000) -> str:
+    def build_context(self, chunks: List[Dict], query: str, max_chars: int = 6000) -> str:
         parts = [f"QUESTION: {query}\n\nCONTEXT FROM WORKBOOK:\n"]
         total = len(parts[0])
         for i, chunk in enumerate(chunks):

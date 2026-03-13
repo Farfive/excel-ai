@@ -39,7 +39,7 @@ class OllamaClient:
             async with session.post(
                 f"{self.base_url}/api/chat",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=240),
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
@@ -52,7 +52,7 @@ class OllamaClient:
                 async with session.post(
                     f"{self.base_url}/api/chat",
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=120),
+                    timeout=aiohttp.ClientTimeout(total=240),
                 ) as resp:
                     resp.raise_for_status()
                     data = await resp.json()

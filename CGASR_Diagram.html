@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CGASR Architecture Diagram</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0f; color: #e0e0e0; padding: 24px; }
+  h1 { text-align: center; font-size: 28px; margin-bottom: 8px; color: #f97316; }
+  h2 { font-size: 22px; margin: 32px 0 16px; color: #f97316; border-bottom: 1px solid #222; padding-bottom: 8px; }
+  h3 { font-size: 17px; margin: 20px 0 10px; color: #fbbf24; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 32px; font-size: 14px; }
+  .diagram-container { background: #111118; border: 1px solid #222; border-radius: 12px; padding: 24px; margin: 16px 0; overflow-x: auto; }
+  .diagram-container .mermaid { display: flex; justify-content: center; }
+  .legend { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; margin: 12px 0 24px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .legend-dot { width: 14px; height: 14px; border-radius: 3px; }
+  .section { background: #111118; border: 1px solid #222; border-radius: 12px; padding: 24px; margin: 16px 0; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th { background: #1a1a24; color: #f97316; text-align: left; padding: 10px 12px; border-bottom: 2px solid #333; }
+  td { padding: 8px 12px; border-bottom: 1px solid #222; }
+  tr:hover td { background: #1a1a20; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge-new { background: #f9731622; color: #f97316; border: 1px solid #f9731644; }
+  .badge-mod { background: #3b82f622; color: #60a5fa; border: 1px solid #3b82f644; }
+  .badge-exist { background: #22c55e22; color: #4ade80; border: 1px solid #22c55e44; }
+  .phase { border-left: 3px solid #f97316; padding-left: 16px; margin: 16px 0; }
+  .phase-header { display: flex; justify-content: space-between; align-items: center; }
+  .phase-time { color: #888; font-size: 13px; }
+  .file-list { list-style: none; padding: 0; }
+  .file-list li { padding: 4px 0; font-size: 13px; color: #ccc; }
+  .file-list li::before { content: "📄 "; }
+  .arrow-flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+  .arrow-flow .step { background: #1a1a24; border: 1px solid #333; border-radius: 8px; padding: 8px 14px; font-size: 13px; }
+  .arrow-flow .arrow { color: #f97316; font-weight: bold; }
+  code { background: #1a1a24; padding: 2px 6px; border-radius: 4px; font-size: 13px; color: #fbbf24; }
+  .weakness-tag { display: inline-block; background: #ef444422; color: #f87171; border: 1px solid #ef444444; padding: 1px 6px; border-radius: 3px; font-size: 11px; margin: 0 2px; }
+</style>
+</head>
+<body>
+
+<h1>CellGraph-Attention Spectral Retrieval (CGASR)</h1>
+<p class="subtitle">Architecture Diagram & Implementation Plan — Excel AI Financial Modeling Assistant</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#f97316"></div> New CGASR component</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div> Modified existing</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div> Existing (unchanged)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#a855f7"></div> Data store</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════ -->
+<!-- DIAGRAM 1: UPLOAD / PREPROCESSING PIPELINE -->
+<!-- ══════════════════════════════════════════════════════════════════ -->
+
+<h2>1. Upload / Preprocessing Pipeline (runs once per workbook)</h2>
+
+<div class="diagram-container">
+<pre class="mermaid">
+flowchart TD
+    classDef newNode fill:#f97316,stroke:#c2410c,color:#000,font-weight:bold
+    classDef modNode fill:#3b82f6,stroke:#1d4ed8,color:#fff,font-weight:bold
+    classDef existNode fill:#22c55e,stroke:#15803d,color:#000,font-weight:bold
+    classDef storeNode fill:#a855f7,stroke:#7c3aed,color:#fff,font-weight:bold
+    classDef dataNode fill:#334155,stroke:#475569,color:#e2e8f0
+
+    UPLOAD["📁 .xlsx Upload"]:::existNode
+    PARSE["XLSXParser.parse()"]:::existNode
+    WB_DATA["WorkbookData\n(cells, sheets, formulas)"]:::dataNode
+
+    GRAPH_BUILD["DependencyGraphBuilder.build()\n→ NetworkX DiGraph"]:::existNode
+    ALGO["run_algorithms()\nPageRank + Louvain + IsolationForest"]:::existNode
+
+    SPATIAL["🆕 build_spatial_graph()\nHash-based 8-neighbor + cross-sheet"]:::newNode
+    FORMULA_W["🆕 compute_formula_weights()\nβ_type · fan_in^(-0.5)"]:::newNode
+    DUAL_LAP["🆕 Combined Laplacian\nL = 0.7·L_f + 0.3·L_s"]:::newNode
+    SPECTRAL["🆕 Spectral Decomposition\neigsh() → K=64 eigenpairs"]:::newNode
+    PE["🆕 Spectral PE\n[u₁[i]..u_K[i]] per cell"]:::newNode
+
+    TENSOR["🆕 4D Tensor Construction\nrow × col × sheet × type"]:::newNode
+    CP["🆕 CP Decomposition\nrank=16, tensorly.parafac"]:::newNode
+    TE["🆕 Tensor Embedding\nTE(cᵢ) ∈ ℝ¹⁶"]:::newNode
+
+    CHUNK["ChunkBuilder.build_chunks()\nLouvain clusters → chunks"]:::existNode
+    EMBED["SentenceTransformer.embed()\n→ SE ∈ ℝ⁷⁶⁸"]:::existNode
+
+    FUSE["🆕 Fused Embedding\nE = W·[PE‖TE‖SE] ∈ ℝ⁷⁶⁸"]:::newNode
+    WAVELET["🆕 Wavelet Coefficients\n4 scales: 0.5, 2, 8, 32"]:::newNode
+    ROLES["🆕 Cell Role Classification\nHEADER→LINE_ITEM→SUBTOTAL→TOTAL"]:::newNode
+
+    CHROMA[("ChromaDB\nchunk embeddings")]:::storeNode
+    BM25["BM25 Index"]:::existNode
+    CGASR_IDX[("🆕 CGASRIndex\nall precomputed structures")]:::storeNode
+
+    UPLOAD --> PARSE --> WB_DATA
+    WB_DATA --> GRAPH_BUILD --> ALGO
+    
+    ALGO --> SPATIAL
+    ALGO --> FORMULA_W
+    SPATIAL --> DUAL_LAP
+    FORMULA_W --> DUAL_LAP
+    DUAL_LAP --> SPECTRAL --> PE
+
+    WB_DATA --> TENSOR --> CP --> TE
+
+    ALGO --> CHUNK --> EMBED
+    EMBED --> CHROMA
+    EMBED --> BM25
+
+    PE --> FUSE
+    TE --> FUSE
+    EMBED --> FUSE
+
+    SPECTRAL --> WAVELET
+    DUAL_LAP --> WAVELET
+    WB_DATA --> ROLES
+
+    FUSE --> CGASR_IDX
+    WAVELET --> CGASR_IDX
+    ROLES --> CGASR_IDX
+    PE --> CGASR_IDX
+</pre>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════ -->
+<!-- DIAGRAM 2: QUERY-TIME RETRIEVAL PIPELINE -->
+<!-- ══════════════════════════════════════════════════════════════════ -->
+
+<h2>2. Query-Time Retrieval Pipeline (runs per question)</h2>
+
+<div class="diagram-container">
+<pre class="mermaid">
+flowchart TD
+    classDef newNode fill:#f97316,stroke:#c2410c,color:#000,font-weight:bold
+    classDef modNode fill:#3b82f6,stroke:#1d4ed8,color:#fff,font-weight:bold
+    classDef existNode fill:#22c55e,stroke:#15803d,color:#000,font-weight:bold
+    classDef storeNode fill:#a855f7,stroke:#7c3aed,color:#fff,font-weight:bold
+    classDef dataNode fill:#334155,stroke:#475569,color:#e2e8f0
+    classDef decNode fill:#eab308,stroke:#a16207,color:#000,font-weight:bold
+
+    QUERY["💬 User Query"]:::existNode
+    DIRECT{"Direct Lookup?\n(regex match)"}:::existNode
+    DIRECT_RES["Direct answer\n(bypass RAG)"]:::existNode
+
+    Q_EMBED["Query Embedding\nSentenceTransformer"]:::existNode
+    
+    ROUTER{"🆕 Query Router\nSimple vs Complex?"}:::decNode
+
+    subgraph CEA_PATH ["⚡ CEA Fast Path (~150ms)"]
+        direction TB
+        CEA_CMI["Conditional MI\nI(cᵢ; q | neighbors)"]:::newNode
+        CEA_GAT["2-Layer GAT\n(parameter-free)"]:::newNode
+        CEA_IMP["CEA Importance\n0.2·entropy + 0.3·CMI + 0.5·GAT"]:::newNode
+        CEA_CMI --> CEA_GAT --> CEA_IMP
+    end
+
+    subgraph CGASR_PATH ["🔬 CGASR Full Path (~350ms)"]
+        direction TB
+        CELL_REL["Cell Relevances\nE · q → cosine scores"]:::newNode
+        SCALE["Adaptive Scale Selection\nspectral energy → w_s"]:::newNode
+        PPR["Personalized PageRank\n25 iterations, query teleport"]:::newNode
+        WAVE_PROP["Multi-Scale Wavelet\nΣ w_s · Ψ_s · π_q"]:::newNode
+        CELL_REL --> SCALE
+        CELL_REL --> PPR
+        SCALE --> WAVE_PROP
+        PPR --> WAVE_PROP
+    end
+
+    CHUNK_SCORE["🆕 Chunk Scoring\nrole-weighted attention pooling"]:::newNode
+    ATTN["🆕 Cross-Attention\nATTN(C_j, q)"]:::newNode
+    UNCERT["🆕 Uncertainty Estimation\nspectral gap + entropy → σ"]:::newNode
+    FINAL["🆕 Final Score\nsigmoid(γ₁·ATTN + γ₂·maxIMP + γ₃·PPR + γ₄·gap)"]:::newNode
+    MMR["🆕 MMR + Uncertainty\nλ·score·(1-σ) - (1-λ)·max_sim"]:::newNode
+
+    CONTEXT["Build Context\ntop-k chunks → text"]:::modNode
+    LLM["LLM (Groq/Ollama)\nGenerate answer"]:::existNode
+    ANSWER["📊 Answer + Confidence"]:::existNode
+
+    QUERY --> DIRECT
+    DIRECT -- "Yes" --> DIRECT_RES
+    DIRECT -- "No" --> Q_EMBED
+    Q_EMBED --> ROUTER
+    ROUTER -- "Simple/Fast" --> CEA_PATH
+    ROUTER -- "Complex/Cross-sheet" --> CGASR_PATH
+    
+    CEA_IMP --> CHUNK_SCORE
+    WAVE_PROP --> CHUNK_SCORE
+    
+    CHUNK_SCORE --> ATTN
+    CHUNK_SCORE --> UNCERT
+    ATTN --> FINAL
+    UNCERT --> FINAL
+    FINAL --> MMR
+    MMR --> CONTEXT
+    CONTEXT --> LLM --> ANSWER
+</pre>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════ -->
+<!-- DIAGRAM 3: WEAKNESS → SOLUTION MAPPING -->
+<!-- ══════════════════════════════════════════════════════════════════ -->
+
+<h2>3. How Each Weakness Gets Solved</h2>
+
+<div class="diagram-container">
+<pre class="mermaid">
+flowchart LR
+    classDef weakness fill:#ef4444,stroke:#dc2626,color:#fff,font-weight:bold
+    classDef solution fill:#22c55e,stroke:#16a34a,color:#000,font-weight:bold
+    classDef component fill:#f97316,stroke:#c2410c,color:#000,font-weight:bold
+
+    W1["W1: Spatial\nBlindness"]:::weakness
+    W2["W2: Static Graph\nTraversal"]:::weakness
+    W3["W3: Query-Agnostic\nImportance"]:::weakness
+    W4["W4: Flat Chunk\nRepresentation"]:::weakness
+    W5["W5: No Formula\nSemantics"]:::weakness
+    W6["W6: Cross-Sheet\nCollapse"]:::weakness
+    W7["W7: No Confidence\nModeling"]:::weakness
+
+    S1["Dual-Graph Laplacian\n+ Spectral PE"]:::component
+    S2["Multi-Scale Wavelets\n4 scales"]:::component
+    S3["Personalized PageRank\nquery teleportation"]:::component
+    S4["Role Classification\n+ Attention Pooling"]:::component
+    S5["Formula Edge Weights\nβ_type · fan_in"]:::component
+    S6["Coarse Wavelet s=32\nfull chain propagation"]:::component
+    S7["Spectral Gap + Entropy\nσ ∈ [0,1]"]:::component
+
+    W1 --> S1
+    W2 --> S2
+    W3 --> S3
+    W4 --> S4
+    W5 --> S5
+    W6 --> S6
+    W7 --> S7
+</pre>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════ -->
+<!-- DIAGRAM 4: DATA FLOW DETAIL -->
+<!-- ══════════════════════════════════════════════════════════════════ -->
+
+<h2>4. Detailed Data Flow: "How does WACC affect the valuation?"</h2>
+
+<div class="diagram-container">
+<pre class="mermaid">
+sequenceDiagram
+    participant U as User
+    participant FE as Frontend
+    participant API as /ask Endpoint
+    participant R as CGASR Retriever
+    participant IDX as CGASRIndex
+    participant LLM as LLM (Groq)
+
+    U->>FE: "How does WACC affect the valuation?"
+    FE->>API: POST /ask {query, mode: "ask"}
+    API->>R: retrieve(query, uuid, k=15)
+    
+    Note over R: Step 1: Direct lookup → NO (reasoning query)
+    
+    R->>R: embed(query) → q ∈ ℝ⁷⁶⁸
+    R->>R: Router → CGASR (cross-sheet keywords)
+    
+    R->>IDX: cell_relevances = E · q
+    Note over IDX: Assumptions!B13 (WACC) scores highest
+    
+    R->>IDX: spectral energy → coarse scale s=32 dominates
+    Note over IDX: Query needs global propagation
+    
+    R->>IDX: PersonalizedPageRank(teleport=relevances)
+    Note over IDX: π_q concentrates on WACC cell + downstream
+    
+    R->>IDX: wavelet_propagate(π_q, scales=[0.5,2,8,32])
+    Note over IDX: s=32 wavelet propagates WACC importance<br/>through Assumptions→P&L→CashFlow→DCF chain
+    
+    R->>R: score_chunks() with role weights
+    Note over R: DCF chunk (TOTAL cells) scores highest<br/>Assumptions chunk scores 2nd<br/>P&L chunk scores 3rd
+    
+    R->>R: uncertainty estimation
+    Note over R: σ_DCF = 0.15 (confident)<br/>σ_Assumptions = 0.10 (very confident)
+    
+    R->>R: MMR ranking → top 15 chunks
+    R-->>API: chunks + scores + σ
+    
+    API->>API: build_context(chunks, max=12000)
+    API->>LLM: system + context + cell_index + query
+    LLM-->>API: "WACC (10%) in Assumptions!B13 affects..."
+    API-->>FE: SSE stream answer
+    FE-->>U: Answer with confidence indicator
+</pre>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════ -->
+<!-- DIAGRAM 5: FILE ARCHITECTURE -->
+<!-- ══════════════════════════════════════════════════════════════════ -->
+
+<h2>5. File Architecture — What Changes</h2>
+
+<div class="diagram-container">
+<pre class="mermaid">
+graph TD
+    classDef newFile fill:#f97316,stroke:#c2410c,color:#000,font-weight:bold
+    classDef modFile fill:#3b82f6,stroke:#1d4ed8,color:#fff,font-weight:bold
+    classDef existFile fill:#22c55e,stroke:#15803d,color:#000
+
+    ROOT["backend/"]:::existFile
+
+    subgraph RAG ["rag/"]
+        R1["retrieval.py\n(existing RAGRetriever)"]:::existFile
+        R2["chroma_store.py"]:::existFile
+        R3["local_embedder.py"]:::existFile
+        R4["chunker.py"]:::existFile
+        R5["🆕 cgasr_index.py\nCGASRIndex + preprocessing"]:::newFile
+        R6["🆕 cgasr_retriever.py\nCGASRRetriever + query-time"]:::newFile
+        R7["🆕 cea_retriever.py\nCEA fast fallback"]:::newFile
+        R8["🆕 cgasr_eval.py\nevaluation harness"]:::newFile
+    end
+
+    subgraph PARSER ["parser/"]
+        P1["graph_builder.py"]:::existFile
+        P2["xlsx_parser.py"]:::existFile
+    end
+
+    subgraph API ["api/routes/"]
+        A1["workbook.py\n(+CGASR init in upload)"]:::modFile
+    end
+
+    subgraph AGENT ["agent/"]
+        AG1["excel_agent.py\n(+swap retriever)"]:::modFile
+    end
+
+    REQ["requirements.txt\n(+tensorly)"]:::modFile
+
+    ROOT --> RAG
+    ROOT --> PARSER
+    ROOT --> API
+    ROOT --> AGENT
+    ROOT --> REQ
+</pre>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════ -->
+<!-- DIAGRAM 6: CEA vs CGASR ROUTING -->
+<!-- ══════════════════════════════════════════════════════════════════ -->
+
+<h2>6. CEA ↔ CGASR Routing Decision</h2>
+
+<div class="diagram-container">
+<pre class="mermaid">
+flowchart TD
+    classDef newNode fill:#f97316,stroke:#c2410c,color:#000,font-weight:bold
+    classDef ceaNode fill:#06b6d4,stroke:#0891b2,color:#000,font-weight:bold
+    classDef cgasrNode fill:#a855f7,stroke:#7c3aed,color:#fff,font-weight:bold
+    classDef directNode fill:#22c55e,stroke:#15803d,color:#000,font-weight:bold
+
+    Q["Incoming Query"]
+    D{"Direct lookup\nregex match?"}
+    DL["✅ Direct Lookup\n< 5ms"]:::directNode
+
+    KW{"Cross-sheet or\nsensitivity keywords?"}
+    SIZE{"Workbook > 8000 cells\nAND simple question?"}
+
+    CEA["⚡ CEA Retriever\n~150ms\n2-layer GAT + entropy"]:::ceaNode
+    CGASR["🔬 CGASR Retriever\n~350ms\nspectral wavelets + PPR"]:::cgasrNode
+
+    Q --> D
+    D -- "Yes" --> DL
+    D -- "No" --> KW
+    KW -- "Yes" --> CGASR
+    KW -- "No" --> SIZE
+    SIZE -- "Yes" --> CEA
+    SIZE -- "No" --> CGASR
+</pre>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#f97316',
+    primaryTextColor: '#000',
+    primaryBorderColor: '#c2410c',
+    lineColor: '#555',
+    secondaryColor: '#1e293b',
+    tertiaryColor: '#334155',
+    fontSize: '14px',
+  },
+  flowchart: { curve: 'basis', padding: 16 },
+  sequence: { actorMargin: 30, messageMargin: 20, mirrorActors: false }
+});
+</script>
+
+</body>
+</html>

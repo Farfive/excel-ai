@@ -9,6 +9,7 @@ from config.settings import get_settings
 from parser.xlsx_parser import WorkbookData
 from analysis.audit_trail import AuditTrail
 from analysis.scenarios import ScenarioManager
+from rag.cgasr_index import CGASRIndex
 
 settings = get_settings()
 
@@ -22,7 +23,7 @@ chroma = ChromaStore(chroma_path=settings.chroma_path)
 if settings.groq_api_key:
     ollama = GroqClient(
         api_key=settings.groq_api_key,
-        model=settings.groq_model,
+        model="llama-3.1-8b-instant",
     )
 else:
     ollama = OllamaClient(
@@ -38,6 +39,7 @@ workbook_data_cache: Dict[str, WorkbookData] = {}
 workbook_states: Dict[str, Dict[str, Any]] = {}
 audit_trails: Dict[str, AuditTrail] = {}
 scenario_managers: Dict[str, ScenarioManager] = {}
+cgasr_indices: Dict[str, CGASRIndex] = {}
 
 
 def get_embedder() -> LocalEmbedder:
@@ -74,3 +76,7 @@ def get_audit_trails() -> Dict[str, AuditTrail]:
 
 def get_scenario_managers() -> Dict[str, ScenarioManager]:
     return scenario_managers
+
+
+def get_cgasr_indices() -> Dict[str, CGASRIndex]:
+    return cgasr_indices
