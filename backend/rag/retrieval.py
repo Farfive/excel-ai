@@ -8,6 +8,10 @@ from rank_bm25 import BM25Okapi
 
 from rag.local_embedder import LocalEmbedder
 from rag.chroma_store import ChromaStore
+from rag.query_decomposer import decompose_query, is_complex_query
+from rag.formula_chain import unroll_formula_chain, extract_seed_addresses
+from rag.colbert_scorer import colbert_rerank
+from rag.contextual_compressor import compress_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -579,43 +583,33 @@ class RAGRetriever:
         logger.info(f"Valuation inject: {len(injected_lines)} lines incl. derived values")
         return [injected_chunk] + chunks
 
-    async def retrieve(
+    async def _single_query_retrieve(
         self,
         query: str,
         workbook_uuid: str,
         k: int = 15,
         workbook_data: Any = None,
     ) -> List[Dict]:
-        """Enhanced retrieval pipeline with CGASR spectral retrieval.
+        """Core retrieval for a single query (used by decomposed multi-query too)."""
 
-        If CGASR index is available, runs spectral retrieval in parallel
-        with the classic pipeline and merges results via score fusion.
-        Falls back to classic pipeline if CGASR is not available.
-        """
-
-        # --- Step 1: Direct lookup for simple queries ---
-        direct_ctx = self.direct_lookup(query, workbook_data)
-        if direct_ctx:
-            return [{"chunk_id": "direct_lookup", "text": direct_ctx, "metadata": {}}]
-
-        # --- Step 2: HyDE embedding ---
+        # --- Step 1: HyDE embedding ---
         try:
             query_emb = await self.hyde_embed(query)
         except Exception as e:
             logger.warning(f"Embedding failed: {e}")
             return []
 
-        # --- Step 3: Vector search ---
+        # --- Step 2: Vector search ---
         try:
             vector_candidates = self.store.query(workbook_uuid, query_emb, n=20)
         except Exception as e:
             logger.warning(f"Chroma query failed: {e}")
             vector_candidates = []
 
-        # --- Step 4: BM25 keyword search ---
+        # --- Step 3: BM25 keyword search ---
         bm25_results = self._bm25_search(query, n=20)
 
-        # --- Step 5: RRF fusion ---
+        # --- Step 4: RRF fusion ---
         vector_ranked = [
             (c["chunk_id"], 1.0 - c.get("distance", 0.0))
             for c in vector_candidates
@@ -643,17 +637,17 @@ class RAGRetriever:
             f"Hybrid search: {len(vector_candidates)} vector + {len(bm25_results)} BM25 → {len(fused_chunks)} fused"
         )
 
-        # --- Step 6: Sheet metadata boost ---
+        # --- Step 5: Sheet metadata boost ---
         sheet_hint = _extract_sheet_hint(query)
         fused_chunks = self._filter_by_sheet(fused_chunks, sheet_hint)
 
-        # --- Step 7: Graph expansion ---
+        # --- Step 6: Graph expansion ---
         expanded = self.graph_expand(fused_chunks, n_hops=1)
 
-        # --- Step 8: Cross-encoder reranking ---
+        # --- Step 7: Cross-encoder reranking ---
         reranked = self._cross_encoder_rerank(query, expanded, top_k=k)
 
-        # --- Step 8.5: CGASR spectral re-ranking (if index available) ---
+        # --- Step 8: CGASR spectral re-ranking (if index available) ---
         if self.cgasr_index is not None and self.cgasr_index.N > 0:
             try:
                 CGASRRetriever = _get_cgasr_retriever()
@@ -663,7 +657,6 @@ class RAGRetriever:
                     chunks=reranked,
                     k=k,
                 )
-                # Merge: use CGASR ordering but preserve chunk data
                 if cgasr_results:
                     reranked_cgasr = []
                     for cr in cgasr_results:
@@ -671,7 +664,6 @@ class RAGRetriever:
                         chunk["cgasr_score"] = cr["score"]
                         chunk["cgasr_uncertainty"] = cr["uncertainty"]
                         reranked_cgasr.append(chunk)
-                    # Add any classic chunks that CGASR didn't select
                     seen_ids = {c.get("chunk_id") for c in reranked_cgasr}
                     for c in reranked:
                         if c.get("chunk_id") not in seen_ids:
@@ -684,7 +676,107 @@ class RAGRetriever:
             except Exception as e:
                 logger.warning(f"CGASR reranking failed (using classic): {e}")
 
-        # --- Step 9: Valuation sheet injection for DCF/EV queries ---
+        # --- Step 9: ColBERT late interaction reranking ---
+        try:
+            reranked = colbert_rerank(
+                query, reranked, self.embedder,
+                query_embedding=np.array(query_emb, dtype=np.float32),
+                top_k=k,
+            )
+        except Exception as e:
+            logger.warning(f"ColBERT rerank failed (skipping): {e}")
+
+        return reranked
+
+    async def retrieve(
+        self,
+        query: str,
+        workbook_uuid: str,
+        k: int = 15,
+        workbook_data: Any = None,
+    ) -> List[Dict]:
+        """Full enhanced retrieval pipeline.
+
+        Steps:
+        1. Direct lookup for simple queries
+        2. Query decomposition for complex queries (multi-query retrieval + RRF merge)
+        3. Single-query retrieval (HyDE → vector + BM25 → RRF → graph expand → cross-encoder → CGASR → ColBERT)
+        4. Formula chain unrolling (inject dependency traces into context)
+        5. Contextual compression (keep only query-relevant lines)
+        6. Valuation sheet injection
+        """
+
+        # --- Step 1: Direct lookup for simple queries ---
+        direct_ctx = self.direct_lookup(query, workbook_data)
+        if direct_ctx:
+            return [{"chunk_id": "direct_lookup", "text": direct_ctx, "metadata": {}}]
+
+        # --- Step 2: Query decomposition ---
+        try:
+            sub_queries = await decompose_query(query, self.ollama)
+        except Exception as e:
+            logger.warning(f"Query decomposition failed: {e}")
+            sub_queries = [query]
+
+        # --- Step 3: Retrieve per sub-query and merge ---
+        if len(sub_queries) > 1:
+            all_ranked_lists = []
+            all_chunks_map: Dict[str, Dict] = {}
+
+            for sq in sub_queries:
+                sq_results = await self._single_query_retrieve(
+                    sq, workbook_uuid, k=k, workbook_data=workbook_data
+                )
+                ranked = [(c.get("chunk_id", f"unk_{i}"), 1.0 / (i + 1)) for i, c in enumerate(sq_results)]
+                all_ranked_lists.append(ranked)
+                for c in sq_results:
+                    cid = c.get("chunk_id")
+                    if cid and cid not in all_chunks_map:
+                        all_chunks_map[cid] = c
+
+            merged_ranking = _rrf_fuse(all_ranked_lists, k=60)
+            reranked = []
+            for doc_id, _ in merged_ranking[:k]:
+                if doc_id in all_chunks_map:
+                    reranked.append(all_chunks_map[doc_id])
+
+            logger.info(
+                f"Multi-query merge: {len(sub_queries)} sub-queries → "
+                f"{sum(len(rl) for rl in all_ranked_lists)} total → {len(reranked)} merged"
+            )
+        else:
+            reranked = await self._single_query_retrieve(
+                query, workbook_uuid, k=k, workbook_data=workbook_data
+            )
+
+        # --- Step 4: Formula chain unrolling ---
+        if workbook_data is not None and self.graph.number_of_edges() > 0:
+            try:
+                seeds = extract_seed_addresses(reranked, max_seeds=8)
+                if seeds:
+                    chain_text = unroll_formula_chain(
+                        seeds, self.graph, workbook_data, max_depth=3, direction="both"
+                    )
+                    if chain_text:
+                        chain_chunk = {
+                            "chunk_id": "formula_chain",
+                            "text": chain_text,
+                            "metadata": {"sheet": "_formula_chain", "cell_addresses": seeds},
+                        }
+                        reranked.insert(0, chain_chunk)
+                        logger.info(f"Formula chain injected: {len(seeds)} seeds")
+            except Exception as e:
+                logger.warning(f"Formula chain unrolling failed: {e}")
+
+        # --- Step 5: Contextual compression ---
+        try:
+            reranked = await compress_chunks(
+                reranked, query, ollama_client=self.ollama, use_llm=False,
+            )
+        except Exception as e:
+            logger.warning(f"Contextual compression failed: {e}")
+
+        # --- Step 6: Valuation sheet injection for DCF/EV queries ---
         reranked = self._inject_valuation_sheets(reranked, workbook_data, query)
 
         return reranked

@@ -10,7 +10,10 @@ Builds all precomputed structures at workbook upload time:
 - Cell role classification
 """
 
+import json
 import logging
+import os
+import pickle
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -59,6 +62,66 @@ class CGASRIndex:
     N: int
     K: int
     build_time_ms: int = 0
+
+    def save(self, path: str) -> None:
+        """Save CGASR index to disk for fast reload after server restart."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        t0 = time.time()
+        data = {
+            "arrays": {
+                "cell_embeddings": self.cell_embeddings,
+                "spectral_PE": self.spectral_PE,
+                "tensor_TE": self.tensor_TE,
+                "eigenvalues": self.eigenvalues,
+                "eigenvectors": self.eigenvectors,
+            },
+            "sparse": {
+                "L": self.L,
+                "P": self.P,
+            },
+            "meta": {
+                "wavelets": self.wavelets,
+                "roles": self.roles,
+                "cell_to_idx": self.cell_to_idx,
+                "cell_ids": self.cell_ids,
+                "scales": self.scales,
+                "N": self.N,
+                "K": self.K,
+                "build_time_ms": self.build_time_ms,
+            },
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        ms = int((time.time() - t0) * 1000)
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        logger.info(f"CGASR index saved: {path} ({size_mb:.1f}MB) in {ms}ms")
+
+    @classmethod
+    def load(cls, path: str) -> "CGASRIndex":
+        """Load CGASR index from disk."""
+        t0 = time.time()
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        idx = cls(
+            cell_embeddings=data["arrays"]["cell_embeddings"],
+            spectral_PE=data["arrays"]["spectral_PE"],
+            tensor_TE=data["arrays"]["tensor_TE"],
+            eigenvalues=data["arrays"]["eigenvalues"],
+            eigenvectors=data["arrays"]["eigenvectors"],
+            wavelets=data["meta"]["wavelets"],
+            roles=data["meta"]["roles"],
+            cell_to_idx=data["meta"]["cell_to_idx"],
+            cell_ids=data["meta"]["cell_ids"],
+            L=data["sparse"]["L"],
+            P=data["sparse"]["P"],
+            scales=data["meta"]["scales"],
+            N=data["meta"]["N"],
+            K=data["meta"]["K"],
+            build_time_ms=data["meta"]["build_time_ms"],
+        )
+        ms = int((time.time() - t0) * 1000)
+        logger.info(f"CGASR index loaded: {path} (N={idx.N}, K={idx.K}) in {ms}ms")
+        return idx
 
 
 def _cell_type_id(cell) -> int:

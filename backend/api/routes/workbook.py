@@ -24,7 +24,7 @@ from parser.graph_builder import DependencyGraphBuilder
 from rag.chunker import ChunkBuilder
 from rag.chroma_store import ChunkRecord
 from rag.retrieval import RAGRetriever
-from rag.cgasr_index import build_cgasr_index
+from rag.cgasr_index import build_cgasr_index, CGASRIndex
 from agent.excel_agent import ExcelAgent
 from agent.tools import ExcelTools
 from db.connection import get_db, WorkbookSession
@@ -95,14 +95,18 @@ async def upload_workbook(
         except Exception as e:
             logger.warning(f"BM25 index build skipped: {e}")
 
-        # Build CGASR spectral index
+        # Build CGASR spectral index (using embedder for per-cell embeddings)
         try:
-            import numpy as np
-            emb_matrix = np.array(embeddings, dtype=np.float32)
             cgasr_idx = build_cgasr_index(
-                workbook_data, graph, existing_embeddings=emb_matrix,
+                workbook_data, graph, embedder=embedder,
             )
             cgasr_store[workbook_uuid] = cgasr_idx
+            # Persist to disk for fast reload after server restart
+            cgasr_path = os.path.join(".cgasr_cache", f"{workbook_uuid}.cgasr")
+            try:
+                cgasr_idx.save(cgasr_path)
+            except Exception as save_err:
+                logger.warning(f"CGASR save to disk failed: {save_err}")
             logger.info(f"CGASR index built: N={cgasr_idx.N}, K={cgasr_idx.K}, {cgasr_idx.build_time_ms}ms")
         except Exception as e:
             logger.warning(f"CGASR index build failed (retrieval will use fallback): {e}")
@@ -167,6 +171,16 @@ async def ask(
 
     tools = ExcelTools(workbook_state=workbook_state, graph=graph, workbook_data=workbook_data)
     cgasr_idx = cgasr_store.get(uuid)
+    # Lazy-load CGASR index from disk if not in memory
+    if cgasr_idx is None:
+        cgasr_path = os.path.join(".cgasr_cache", f"{uuid}.cgasr")
+        if os.path.exists(cgasr_path):
+            try:
+                cgasr_idx = CGASRIndex.load(cgasr_path)
+                cgasr_store[uuid] = cgasr_idx
+                logger.info(f"CGASR index loaded from disk for {uuid}")
+            except Exception as e:
+                logger.warning(f"CGASR disk load failed: {e}")
     retriever = RAGRetriever(
         embedder=embedder, store=chroma, ollama_client=ollama_client,
         graph=graph, cgasr_index=cgasr_idx,
